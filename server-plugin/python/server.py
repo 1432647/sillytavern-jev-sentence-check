@@ -25,6 +25,7 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 # 必须在 import torch 之前设置，见模型仓库 infer.py 的做法
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -183,14 +184,37 @@ def run_stdio(service: Service) -> int:
 
 # ---------------------------------------------------------------------- http
 
-ALLOWED_ORIGIN_PREFIXES = ("http://127.0.0.1", "http://localhost", "http://[::1]", "tauri://")
+# 允许的来源：本机地址，以及桌面端壳子自己的 scheme。
+#
+# ⚠️ 别用前缀白名单硬编码。Tauri 在不同平台用的 origin 不一样：
+#     macOS / Linux → tauri://localhost
+#     Windows       → http://tauri.localhost
+#   只写前者的话，Windows 上的 TauriTavern 预检能过（HTTP 204）但拿不到
+#   Access-Control-Allow-Origin，浏览器会拦下真实请求，表现为
+#   `Failed to fetch`，而且服务端日志里只有 OPTIONS、一个 GET 都看不到。
+#   所以按 URL 解析出 scheme / host 再判断。
+ALLOWED_ORIGIN_SCHEMES = frozenset({"tauri", "file"})
+ALLOWED_ORIGIN_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "tauri.localhost"})
 
 
 def _origin_allowed(origin: str | None) -> bool:
-    """只接受本机来源，挡住外部页面拿这个服务当免费推理后端。"""
-    if origin is None:
+    """只接受本机 / 本地壳子来源，挡住外部网页把这个服务当免费推理后端。
+
+    服务只监听 127.0.0.1，所以这里是纵深防御：防止用户浏览器里随便打开的
+    一个网页把本地 GPU 当算力用。
+    """
+    if not origin:
         return True
-    return origin.startswith(ALLOWED_ORIGIN_PREFIXES)
+
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+
+    if parsed.scheme in ALLOWED_ORIGIN_SCHEMES:
+        return True
+
+    return (parsed.hostname or "").lower() in ALLOWED_ORIGIN_HOSTS
 
 
 class HttpHandler(BaseHTTPRequestHandler):
@@ -200,21 +224,38 @@ class HttpHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: A003
         log(f"http {self.address_string()} {fmt % args}")
 
-    def _send(self, status: int, payload: dict, origin: str | None = None) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def _send(self, status: int, payload: dict | None = None, origin: str | None = None) -> None:
+        # 204 按 RFC 不能带 body；带上会破坏 keep-alive 的帧边界
+        body = b"" if status == 204 or payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        if body:
+            self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+
         if origin and _origin_allowed(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
+
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
-        self.wfile.write(body)
+
+        if body:
+            self.wfile.write(body)
 
     def do_OPTIONS(self):  # noqa: N802
-        self._send(204, {}, self.headers.get("Origin"))
+        origin = self.headers.get("Origin")
+
+        # 来源被拒时回 403，而不是一个「看起来成功」的 204。
+        # 浏览器两种都会拦掉真实请求，但日志里能一眼看出是来源问题，
+        # 而不是留下一个查不出所以然的 Failed to fetch。
+        if origin and not _origin_allowed(origin):
+            log(f"拒绝来源 {origin}（不在允许列表内；浏览器会因此拦下后续请求）")
+            self._send(403, {"ok": False, "error": "origin not allowed"}, origin)
+            return
+
+        self._send(204, None, origin)
 
     def do_GET(self):  # noqa: N802
         if self.path.rstrip("/") in ("/health", ""):
@@ -232,6 +273,7 @@ class HttpHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
 
         if not _origin_allowed(origin):
+            log(f"拒绝来源 {origin}（不在允许列表内）")
             self._send(403, {"ok": False, "error": "origin not allowed"}, origin)
             return
 
