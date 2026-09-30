@@ -48,8 +48,9 @@ body.dark .mes_text mark.custom-jev-mark,
     backdrop-filter: blur(2px);
 }
 
-.jev-overlay.jev-hidden {
-    display: none;
+/* 通用隐藏工具类。扩展自己加的元素统一用它，免得为每个元素单写选择器。 */
+.jev-hidden {
+    display: none !important;
 }
 
 .jev-dialog {
@@ -232,17 +233,87 @@ body.dark .mes_text mark.custom-jev-mark,
     display: none;
 }
 
-/* ------------------------------------------------------ 菜单按钮 */
+/* ------------------------------------------------------ 入口横栏 */
+
+/*
+ * 放在输入框上方自建的一行里（插在 #send_form 的第一个子节点之前），
+ * 做法与 ST 的 quick-reply 相同。
+ */
+.jev-entry-bar {
+    order: 20;                 /* 排在 #nonQRFormItems(order:25) 之前 */
+    display: flex;
+    justify-content: center;
+    width: 100%;
+    margin-bottom: 2px;
+}
+
+.jev-entry-button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    padding: 3px 10px;
+    opacity: 0.85;
+    transition: opacity 0.15s ease;
+}
+
+.jev-entry-button:hover {
+    opacity: 1;
+}
+
+/* ------------------------------------------------------ 总控面板的分区 */
+
+.jev-section-title {
+    font-weight: 600;
+    font-size: 0.95em;
+    opacity: 0.9;
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+    padding-bottom: 3px;
+}
+
+/* 设置面板里的抽屉标题 */
 
 #jev_menu_button {
     cursor: pointer;
 }
-
-/* ------------------------------------------------------ 设置面板 */
 
 .jev-settings-help {
     opacity: 0.7;
     font-size: 0.9em;
     line-height: 1.6;
     margin-bottom: 4px;
+}
+
+/* ------------------------------------------------------ 修改句子的小窗 */
+
+.jev-edit-dialog {
+    width: min(560px, calc(100vw - 32px));
+}
+
+.jev-quote {
+    padding: 6px 9px;
+    border-left: 3px solid rgba(220, 60, 60, 0.6);
+    background-color: rgba(220, 60, 60, 0.08);
+    border-radius: 4px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.jev-edit-dialog textarea {
+    resize: vertical;
+    line-height: 1.6;
+    font-family: inherit;
+}
+
+.jev-edit-dialog .checkbox_label {
+    cursor: pointer;
+    font-size: 0.9em;
+    opacity: 0.9;
+}
+
+/* 阈值滑块：让它在窄面板里也能好好伸展 */
+.jev-dialog input[type="range"] {
+    accent-color: var(--SmartThemeQuoteColor, #7aa2f7);
+    cursor: pointer;
 }

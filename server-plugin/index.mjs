@@ -381,9 +381,34 @@ export async function init(router) {
         const result = await backend.request('predict', {
             sentences,
             include_ordinal: Boolean(req.body?.include_ordinal),
+            threshold: req.body?.threshold,
         });
 
         res.json({ ok: true, ...result });
+    }));
+
+    // 模型管理：与独立后端（direct 模式）保持同样的路径，
+    // 这样前端传输层不用为两种后端分叉。
+    router.get('/models', asyncRoute(async (req, res) => {
+        res.json({ ok: true, ...(await backend.request('list_models', {}, 20000)) });
+    }));
+
+    router.post('/download', asyncRoute(async (req, res) => {
+        const result = await backend.request('download_model', {
+            model: req.body?.model,
+            mirror: req.body?.mirror,
+            target_root: req.body?.target_root,
+            force: Boolean(req.body?.force),
+        }, 30000);
+        res.json({ ok: true, ...result });
+    }));
+
+    router.get('/download_status', asyncRoute(async (req, res) => {
+        res.json({ ok: true, ...(await backend.request('download_status', {}, 10000)) });
+    }));
+
+    router.post('/cancel_download', asyncRoute(async (req, res) => {
+        res.json({ ok: true, ...(await backend.request('cancel_download', {}, 10000)) });
     }));
 
     router.post('/restart', asyncRoute(async (req, res) => {

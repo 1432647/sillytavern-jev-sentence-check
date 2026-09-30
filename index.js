@@ -1,35 +1,50 @@
 /**
  * JEV Sentence Check —— SillyTavern 前端扩展。
  *
- * 流程：点扩展菜单里的按钮 → 弹窗输入楼层表达式 → 分句 → 送后端判定
+ * 流程：点输入框上方的按钮 → 总控面板填楼层表达式 → 分句 → 送后端判定
  *       → 结果写进 chat_metadata → 把「需要修改」的句子在楼层里高亮。
  *
  * 几条刻意的设计约束：
- *  - **不改消息原文**。高亮只存在于渲染层与 chat_metadata，不触发 ST 的「消息已编辑」。
  *  - **高亮 hook 必须同步**。MessageFormatter 不允许 async hook，所以 hook 只读缓存，
  *    所有网络请求都在点击流程里完成。
  *  - **按楼层逐条请求**。进度可见、可随时取消，单次失败不会让整批白跑。
  *  - **swipe 与正文 hash 双重校验**。重 roll 或改过正文的楼层，旧结果一律作废，
  *    宁可不高亮也不能高亮错位置。
+ *  - **检测前先把楼层复制成新的 swipe**（用户要求）。标记与修改都发生在那份副本上，
+ *    原文永远留在 swipe[0]，可以随时滑回去。
+ *  - **阈值在显示时套用**。缓存里只存概率，所以调阈值能立刻重算高亮，不必重跑模型。
  */
 
-import { splitSentences } from './lib/sentence-splitter.js';
+import { splitSentences, parseExcludeTags } from './lib/sentence-splitter.js';
 import { parseFloorExpression, formatFloorExpression } from './lib/floor-parser.js';
 import { applyHighlights } from './lib/highlight.js';
 import { clearHighlights, highlightElement } from './lib/highlight-dom.js';
 import * as store from './lib/store.js';
 import { MODES, createTransport } from './lib/transport.js';
+import * as swipes from './lib/swipes.js';
+import { BACKEND_FILES, buildInstaller } from './lib/backend-install.js';
 
-const MODEL_NAME = 'jev-novel-2-0.8b-bf16';
-const THRESHOLD = 0.5;
 const MARK_CLASS = 'jev-mark';
 const MAX_FLOORS_PER_RUN = 50;
+const DEFAULT_MODEL = 'jev-novel-2-0.8b-bf16';
+
+/** 后端源码在仓库里的位置（相对本文件）。用 URL 拼，扩展挂在哪都能取到。 */
+const BACKEND_SOURCE_BASE = new URL('./server-plugin/python/', import.meta.url);
 
 const DEFAULT_SETTINGS = {
+    // 连接相关 —— 留在扩展设置抽屉里
     mode: MODES.AUTO,
     directBase: 'http://127.0.0.1:8791',
     maxChars: 400,
+    // 总控面板
     lastExpression: '',
+    threshold: store.DEFAULT_THRESHOLD,
+    excludeTags: '',
+    autoUnmarkAfterEdit: false,
+    // 模型管理
+    lastModel: DEFAULT_MODEL,
+    lastMirror: 'modelscope',
+    lastInstallDir: '',
 };
 
 let context = null;
@@ -39,7 +54,10 @@ let transport = null;
 const state = {
     running: false,
     cancelled: false,
-    selectedFloors: [],
+    models: null,
+    downloadTimer: null,
+    /** 正在编辑的高亮：{ messageId, swipeId, text } */
+    editing: null,
 };
 
 let ui = null;
@@ -101,14 +119,28 @@ function element(tag, className, text) {
 
 // ------------------------------------------------------------------ 高亮
 
-/** 取某楼层当前有效的待修改句子；swipe 或正文变了就返回空。 */
+/** 用户配置的排除标签：`<1></1>` → `['1']`。 */
+function excludeTagNames() {
+    return parseExcludeTags(settings?.excludeTags);
+}
+
+/** 当前阈值。缓存里只存概率，所以这个值改了立刻生效。 */
+function currentThreshold() {
+    const value = Number(settings?.threshold);
+    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : store.DEFAULT_THRESHOLD;
+}
+
+/**
+ * 取某楼层当前有效的待修改句子；swipe 或正文变了就返回空。
+ * 阈值在这里套用 —— 所以调阈值能立刻重算高亮，不必把句子重跑一遍。
+ */
 function freshHighlightItems(id) {
     const entry = store.readFloor(context.chatMetadata, id);
     const fresh = store.isEntryFresh(entry, {
         swipeId: currentSwipeId(id),
         hash: currentHash(id),
     });
-    return fresh ? store.toHighlightItems(entry) : [];
+    return fresh ? store.toHighlightItems(entry, currentThreshold()) : [];
 }
 
 /**
@@ -293,6 +325,47 @@ function setBusy(busy) {
     ui.expression.disabled = busy;
 }
 
+/**
+ * 让某条楼层显示它自己的某个 swipe。
+ *
+ * 优先走 ST 的 swipe()（会正确处理动画、计数器、并广播 MESSAGE_SWIPED），
+ * 必须传 `swipe_picker` 来源 —— 否则 ST 会因为「只能滑最后一条」而拒绝操作历史楼层。
+ * 走不通时才退回「直接改数据 + 让 ST 重绘这一条」。
+ */
+async function showSwipeFor(messageId, swipeId) {
+    const message = getMessage(messageId);
+    if (message === null) {
+        return false;
+    }
+
+    const swipeApi = context.swipe;
+    if (swipeApi !== undefined && typeof swipeApi.to === 'function') {
+        try {
+            await swipeApi.to(null, swipes.SWIPE_DIRECTION_RIGHT, {
+                source: swipes.SWIPE_SOURCE_SWIPE_PICKER,
+                forceMesId: messageId,
+                forceSwipeId: swipeId,
+            });
+            return true;
+        } catch (error) {
+            log(`楼层 #${messageId} 走 swipe() 失败，退回直接改数据`, error);
+        }
+    }
+
+    if (!swipes.moveToSwipe(message, swipeId)) {
+        return false;
+    }
+    try {
+        if (typeof context.addOneMessage === 'function') {
+            context.addOneMessage(message, { forceId: messageId, type: 'swipe' });
+        }
+        context.eventSource?.emit?.(context.eventTypes?.MESSAGE_SWIPED, messageId);
+    } catch (error) {
+        log(`楼层 #${messageId} 重绘失败`, error);
+    }
+    return true;
+}
+
 async function runCheck(floors) {
     setBusy(true);
     clearError();
@@ -302,7 +375,8 @@ async function runCheck(floors) {
     let done = 0;
     let sentenceCount = 0;
     let flaggedCount = 0;
-    const checkedIds = [];
+    const skipped = [];
+    const planned = [];
 
     setProgress(0, total, `准备检查 ${total} 个楼层…`);
 
@@ -311,6 +385,9 @@ async function runCheck(floors) {
         // 先发 warmup（立刻返回），再轮询 health，避免一个长请求撞上 Node 的请求超时。
         setProgress(done, total, '正在确认后端状态…');
         await ensureBackendReady();
+
+        const threshold = currentThreshold();
+        const tagNames = excludeTagNames();
 
         for (const id of floors) {
             if (state.cancelled) {
@@ -324,7 +401,25 @@ async function runCheck(floors) {
                 continue;
             }
 
-            const sentences = splitSentences(message.mes, { maxChars: settings.maxChars });
+            // 1. 先复制出一个新的 swipe。之后的标记与修改都发生在副本上，
+            //    原文永远留在原来的那份里，随时可以滑回去。
+            //    只加不切 —— 全部处理完再统一切换，避免中途反复重绘。
+            const newSwipeId = swipes.duplicateToNewSwipe(message);
+            if (newSwipeId === -1) {
+                skipped.push(id);
+                done++;
+                setProgress(done, total, `楼层 #${id} 不支持 swipe，跳过`);
+                continue;
+            }
+
+            const text = message.swipes[newSwipeId];
+
+            // 2. 分句。被排除标签包裹的内容在这里就被剔掉，根本不送模型。
+            const sentences = splitSentences(text, {
+                maxChars: settings.maxChars,
+                excludeTags: tagNames,
+            });
+
             if (sentences.length === 0) {
                 store.clearFloor(context.chatMetadata, id);
                 done++;
@@ -334,37 +429,53 @@ async function runCheck(floors) {
 
             setProgress(done, total, `正在检查楼层 #${id}（${sentences.length} 句）…`);
 
-            const { results } = await transport.predict(sentences);
+            const { results } = await transport.predict(sentences, { threshold });
 
-            const entries = sentences.map((text, index) => ({
-                text,
+            const entries = sentences.map((sentence, index) => ({
+                text: sentence,
                 bad: Number(results[index]?.bad_probability ?? 0),
                 needs_revision: Boolean(results[index]?.needs_revision),
             }));
 
+            // 缓存挂在**新 swipe** 上，切过去之后高亮才对得上
             store.writeFloor(context.chatMetadata, id, {
-                swipeId: currentSwipeId(id),
-                hash: currentHash(id),
-                model: MODEL_NAME,
-                threshold: THRESHOLD,
+                swipeId: newSwipeId,
+                hash: store.hashText(text),
+                model: DEFAULT_MODEL,
+                threshold,
                 sentences: entries,
             });
 
             sentenceCount += entries.length;
-            flaggedCount += entries.filter(item => item.needs_revision).length;
-            checkedIds.push(id);
+            flaggedCount += entries.filter(item => store.needsRevision(item, threshold)).length;
+            planned.push({ id, swipeId: newSwipeId });
             done++;
             setProgress(done, total, `已完成 ${done}/${total} 个楼层`);
         }
 
         context.saveMetadataDebounced();
-        applyToDom(checkedIds);
-        showSummary(checkedIds.length, sentenceCount, flaggedCount);
 
+        // 3. 全部判定完，再统一切到各自的副本并重绘
+        if (planned.length > 0) {
+            setProgress(done, total, '正在切换到标记版…');
+            for (const item of planned) {
+                if (state.cancelled) {
+                    break;
+                }
+                await showSwipeFor(item.id, item.swipeId);
+            }
+        }
+
+        applyToDom(planned.map(item => item.id));
+        showSummary(planned.length, sentenceCount, flaggedCount);
+
+        const skippedNote = skipped.length > 0
+            ? `（${skipped.length} 个楼层不支持 swipe 被跳过：${skipped.join(', ')}）`
+            : '';
         if (state.cancelled) {
             setProgress(done, total, `已取消（完成 ${done}/${total} 个楼层）`);
         } else {
-            setProgress(total, total, `完成：${flaggedCount} 句需要修改`);
+            setProgress(total, total, `完成：${flaggedCount} 句需要修改${skippedNote}`);
         }
 
         renderPreview();
@@ -424,7 +535,7 @@ async function ensureBackendReady() {
 // ------------------------------------------------------------------ 对话框 UI
 
 const DIALOG_HTML = `
-<div class="jev-dialog" role="dialog" aria-modal="true" aria-label="JEV 句子质检">
+<div class="jev-dialog" role="dialog" aria-modal="true" aria-label="JEV 句子质检总控面板">
     <h3>
         <span class="fa-solid fa-magnifying-glass-chart"></span>
         <span>JEV 句子质检</span>
@@ -436,14 +547,16 @@ const DIALOG_HTML = `
     </h3>
 
     <div class="jev-hint">
-        模型对<b>单句</b>判断「可以保留 / 需要修改」，判断为需要修改的句子会被高亮。
+        模型对<b>单句</b>判断「可以保留 / 需要修改」。检查前会先把选中楼层<b>复制成一个新的滑动（swipe）</b>，
+        标记与修改都发生在副本上，原文随时可以滑回去。
         楼层号就是消息左上角的编号，<b>从 0 开始</b>。
     </div>
 
     <div class="jev-section">
+        <div class="jev-section-title">检测</div>
         <div class="jev-row">
             <span class="jev-label">楼层</span>
-            <input class="text_pole jev-mono" data-role="expression" style="flex:1;min-width:200px;"
+            <input class="text_pole jev-mono" data-role="expression" style="flex:1;min-width:180px;"
                    placeholder="例如 3,5,7-9" />
         </div>
         <div class="jev-row">
@@ -452,9 +565,72 @@ const DIALOG_HTML = `
             <button class="menu_button" data-role="fill-last">最近 5 条</button>
             <button class="menu_button" data-role="fill-cached">已检查过的</button>
             <span class="jev-title-spacer"></span>
-            <button class="menu_button" data-role="clear-cache">清除本聊天高亮</button>
+            <button class="menu_button" data-role="clear-cache">清除本聊天结果</button>
         </div>
         <div class="jev-preview" data-role="preview"></div>
+
+        <div class="jev-row">
+            <span class="jev-label">判定阈值</span>
+            <input type="range" min="0.05" max="0.95" step="0.05" data-role="threshold"
+                   style="flex:1;min-width:140px;" />
+            <span class="jev-mono" data-role="threshold-value">0.50</span>
+        </div>
+        <div class="jev-hint">
+            越小越严格（更多句子会被判定为「需要修改」）。
+            改这个值会<b>立刻重算已有结果</b>，不需要重新跑模型。
+        </div>
+
+        <label class="jev-label">排除标签 —— 被这些标签包裹的内容不参与判定</label>
+        <input class="text_pole jev-mono" data-role="exclude-tags" placeholder="例如 &lt;1&gt;&lt;/1&gt; 或 &lt;skip&gt;" />
+        <div class="jev-hint">
+            多个用逗号或换行分隔。<code>&lt;1&gt;&lt;/1&gt;</code>、<code>&lt;1/&gt;</code>、<code>1</code> 三种写法都认。
+            只有<b>成对闭合</b>的标签会被剥掉 —— 少写一个闭合标签不会吞掉后面的正文。
+        </div>
+    </div>
+
+    <div class="jev-section">
+        <div class="jev-section-title">模型</div>
+        <div class="jev-row">
+            <span class="jev-label">使用</span>
+            <select class="text_pole" data-role="model-select" style="flex:1"></select>
+            <button class="menu_button" data-role="model-refresh">刷新</button>
+        </div>
+        <div class="jev-hint" data-role="model-note"></div>
+
+        <div class="jev-row">
+            <span class="jev-label">下载源</span>
+            <select class="text_pole" data-role="mirror-select" style="flex:1"></select>
+        </div>
+        <div class="jev-hint" data-role="mirror-note"></div>
+
+        <div class="jev-row">
+            <button class="menu_button" data-role="download-model">下载所选模型</button>
+            <button class="menu_button" data-role="cancel-download" disabled>取消下载</button>
+            <span class="jev-title-spacer"></span>
+            <span class="jev-hint" data-role="download-state"></span>
+        </div>
+        <div class="jev-progress-track"><div class="jev-progress-bar" data-role="download-bar"></div></div>
+    </div>
+
+    <div class="jev-section">
+        <div class="jev-section-title">独立后端</div>
+        <div class="jev-hint">
+            只给<b>没有服务端插件加载器</b>的客户端用（TauriTavern 等）：需要一个单独跑着的 Python 服务。
+            右上角状态灯显示 <code>direct</code> 就是走的这条路。
+        </div>
+        <div class="jev-row">
+            <span class="jev-label">安装到</span>
+            <input class="text_pole jev-mono" data-role="install-dir" style="flex:1"
+                   placeholder="例如 D:\\jev-backend" />
+        </div>
+        <div class="jev-row">
+            <button class="menu_button" data-role="generate-installer">生成一键安装脚本</button>
+            <button class="menu_button" data-role="warmup">预热后端</button>
+        </div>
+        <div class="jev-hint" data-role="install-hint">
+            浏览器里的扩展没法直接建 Python 环境，所以这里生成一个脚本，
+            下载后双击运行一次即可（需要机器上有 Python 3.11+）。
+        </div>
     </div>
 
     <div class="jev-section">
@@ -469,7 +645,6 @@ const DIALOG_HTML = `
     </div>
 
     <div class="jev-row">
-        <button class="menu_button" data-role="warmup">预热后端</button>
         <span class="jev-title-spacer"></span>
         <button class="menu_button" data-role="cancel" disabled>取消</button>
         <button class="menu_button" data-role="run">开始检查</button>
@@ -477,6 +652,50 @@ const DIALOG_HTML = `
     </div>
 </div>
 `;
+
+/**
+ * 点高亮句子时弹出的小编辑器。
+ * 修改会写进**当前这个 swipe**（也就是检查时复制出来的那份），原文不受影响。
+ */
+const EDIT_HTML = `
+<div class="jev-dialog jev-edit-dialog" role="dialog" aria-modal="true" aria-label="修改句子">
+    <h3>
+        <span class="fa-solid fa-pen-to-square"></span>
+        <span>修改这一句</span>
+        <span class="jev-title-spacer"></span>
+        <span class="jev-hint" data-role="edit-where"></span>
+    </h3>
+
+    <div class="jev-section">
+        <div class="jev-label">原文（模型判定为需要修改）</div>
+        <div class="jev-quote" data-role="edit-original"></div>
+        <div class="jev-label">改成</div>
+        <textarea class="text_pole jev-mono" data-role="edit-text" rows="4" style="width:100%"></textarea>
+    </div>
+
+    <div class="jev-row">
+        <label class="checkbox_label" style="display:flex;align-items:center;gap:6px;">
+            <input type="checkbox" data-role="edit-always-unmark">
+            <span>以后修改后直接取消标记，不再询问</span>
+        </label>
+    </div>
+
+    <div class="jev-error jev-hidden" data-role="edit-error"></div>
+
+    <div class="jev-row">
+        <span class="jev-title-spacer"></span>
+        <button class="menu_button" data-role="edit-cancel">取消</button>
+        <button class="menu_button" data-role="edit-keep">保存并保留标记</button>
+        <button class="menu_button" data-role="edit-unmark">保存并取消标记</button>
+    </div>
+</div>
+`;
+
+/** 摘要按**当前阈值**从缓存重算，这样改阈值后数字也跟着动。 */
+function refreshSummary() {
+    const stats = store.summarize(context.chatMetadata, currentThreshold());
+    showSummary(stats.floors, stats.sentences, stats.flagged);
+}
 
 function buildDialog() {
     const overlay = element('div', 'jev-overlay jev-hidden');
@@ -492,6 +711,19 @@ function buildDialog() {
         statusText: find('status-text'),
         expression: find('expression'),
         preview: find('preview'),
+        threshold: find('threshold'),
+        thresholdValue: find('threshold-value'),
+        excludeTags: find('exclude-tags'),
+        modelSelect: find('model-select'),
+        modelNote: find('model-note'),
+        mirrorSelect: find('mirror-select'),
+        mirrorNote: find('mirror-note'),
+        downloadButton: find('download-model'),
+        cancelDownloadButton: find('cancel-download'),
+        downloadBar: find('download-bar'),
+        downloadState: find('download-state'),
+        installDir: find('install-dir'),
+        installHint: find('install-hint'),
         progressBar: find('progress-bar'),
         progressText: find('progress-text'),
         error: find('error'),
@@ -513,16 +745,50 @@ function buildDialog() {
     });
     find('warmup').addEventListener('click', onWarmupClicked);
     find('clear-cache').addEventListener('click', onClearCacheClicked);
+    find('generate-installer').addEventListener('click', onGenerateInstallerClicked);
+    find('model-refresh').addEventListener('click', () => refreshModels({ announce: true }));
+    find('download-model').addEventListener('click', onDownloadModelClicked);
+    find('cancel-download').addEventListener('click', onCancelDownloadClicked);
 
-    find('fill-all').addEventListener('click', () => fillExpression('all'));
-    find('fill-ai').addEventListener('click', () => fillExpression('ai'));
-    find('fill-last').addEventListener('click', () => fillExpression('last'));
-    find('fill-cached').addEventListener('click', () => fillExpression('cached'));
+    for (const kind of ['all', 'ai', 'last', 'cached']) {
+        find(`fill-${kind}`).addEventListener('click', () => fillExpression(kind));
+    }
 
     ui.expression.addEventListener('input', () => {
         settings.lastExpression = ui.expression.value;
         context.saveSettingsDebounced();
         renderPreview();
+    });
+
+    // 阈值只影响「显示时怎么套用」，所以改完立刻重算高亮即可，不用重跑模型
+    ui.threshold.addEventListener('input', () => {
+        settings.threshold = Number(ui.threshold.value);
+        ui.thresholdValue.textContent = settings.threshold.toFixed(2);
+        context.saveSettingsDebounced();
+        refreshAllFloors();
+        refreshSummary();
+    });
+
+    ui.excludeTags.addEventListener('input', () => {
+        settings.excludeTags = ui.excludeTags.value;
+        context.saveSettingsDebounced();
+    });
+
+    ui.modelSelect.addEventListener('change', () => {
+        settings.lastModel = ui.modelSelect.value;
+        context.saveSettingsDebounced();
+        renderModelNote();
+    });
+
+    ui.mirrorSelect.addEventListener('change', () => {
+        settings.lastMirror = ui.mirrorSelect.value;
+        context.saveSettingsDebounced();
+        renderMirrorNote();
+    });
+
+    ui.installDir.addEventListener('input', () => {
+        settings.lastInstallDir = ui.installDir.value;
+        context.saveSettingsDebounced();
     });
 
     overlay.addEventListener('keydown', event => {
@@ -533,14 +799,71 @@ function buildDialog() {
     });
 
     document.body.appendChild(overlay);
+
+    buildEditDialog();
     return overlay;
+}
+
+/** 点高亮句子时弹出的编辑器。 */
+function buildEditDialog() {
+    const overlay = element('div', 'jev-overlay jev-hidden');
+    overlay.innerHTML = EDIT_HTML;
+
+    const dialog = overlay.querySelector('.jev-dialog');
+    const find = role => dialog.querySelector(`[data-role="${role}"]`);
+
+    ui.edit = {
+        overlay,
+        dialog,
+        where: find('edit-where'),
+        original: find('edit-original'),
+        text: find('edit-text'),
+        alwaysUnmark: find('edit-always-unmark'),
+        error: find('edit-error'),
+        keepButton: find('edit-keep'),
+        unmarkButton: find('edit-unmark'),
+    };
+
+    find('edit-cancel').addEventListener('click', () => hideEditDialog());
+    find('edit-keep').addEventListener('click', () => applyEdit({ unmark: false }));
+    find('edit-unmark').addEventListener('click', () => applyEdit({ unmark: true }));
+
+    // 勾上「不再询问」之后就把两个选择收成一个，避免语义含糊
+    ui.edit.alwaysUnmark.addEventListener('change', () => {
+        settings.autoUnmarkAfterEdit = ui.edit.alwaysUnmark.checked;
+        context.saveSettingsDebounced();
+        syncEditButtons();
+    });
+
+    overlay.addEventListener('keydown', event => {
+        if (event.key === 'Escape') {
+            hideEditDialog();
+        }
+    });
+
+    // 点遮罩空白处关闭
+    overlay.addEventListener('click', event => {
+        if (event.target === overlay) {
+            hideEditDialog();
+        }
+    });
+
+    document.body.appendChild(overlay);
 }
 
 function showDialog() {
     ui.overlay.classList.remove('jev-hidden');
+
     ui.expression.value = settings.lastExpression ?? '';
+    ui.threshold.value = String(currentThreshold());
+    ui.thresholdValue.textContent = currentThreshold().toFixed(2);
+    ui.excludeTags.value = settings.excludeTags ?? '';
+    ui.installDir.value = settings.lastInstallDir ?? '';
+
     renderPreview();
+    refreshSummary();
     refreshBackendStatus();
+    refreshModels();
     setTimeout(() => ui.expression.focus(), 30);
 }
 
@@ -663,14 +986,409 @@ async function onWarmupClicked() {
     }
 }
 
+// ------------------------------------------------------------------ 模型管理
+
+function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+        return '';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+    }
+    return `${value.toFixed(unit === 0 || value >= 100 ? 0 : 1)} ${units[unit]}`;
+}
+
+function selectedModel() {
+    const id = ui.modelSelect.value;
+    return (state.models?.models ?? []).find(model => model.id === id) ?? null;
+}
+
+function renderModelNote() {
+    const model = selectedModel();
+    if (model === null) {
+        ui.modelNote.textContent = '';
+        return;
+    }
+    const bits = [model.note];
+    bits.push(model.installed ? `已装在 ${model.path}` : `尚未下载，会存到 ${model.path}`);
+    if (model.isCurrent) {
+        bits.push('后端当前正在用它');
+    }
+    ui.modelNote.textContent = bits.filter(Boolean).join(' · ');
+}
+
+function renderMirrorNote() {
+    const mirror = (state.models?.mirrors ?? []).find(item => item.id === ui.mirrorSelect.value);
+    ui.mirrorNote.textContent = mirror?.note ?? '';
+}
+
+function fillSelect(select, entries, wanted) {
+    select.replaceChildren();
+    for (const entry of entries) {
+        const option = document.createElement('option');
+        option.value = entry.value;
+        option.textContent = entry.label;
+        select.appendChild(option);
+    }
+    if (entries.some(entry => entry.value === wanted)) {
+        select.value = wanted;
+    }
+}
+
+/**
+ * 拉取模型清单。后端没起来时这里必然失败 —— 但那是**正常状态**，
+ * 不该弹错误挡住主流程，只在模型那一栏里说明一下。
+ */
+async function refreshModels({ announce = false } = {}) {
+    try {
+        const data = await transport.listModels();
+        state.models = data;
+
+        fillSelect(ui.modelSelect,
+            (data.models ?? []).map(model => ({
+                value: model.id,
+                label: `${model.label}${model.installed ? ' ✓' : ''}`,
+            })),
+            ui.modelSelect.value || settings.lastModel);
+
+        fillSelect(ui.mirrorSelect,
+            (data.mirrors ?? []).map(mirror => ({ value: mirror.id, label: mirror.label })),
+            settings.lastMirror || data.defaultMirror);
+
+        renderModelNote();
+        renderMirrorNote();
+        if (announce) {
+            ui.downloadState.textContent = '模型列表已刷新。';
+        }
+        return true;
+    } catch (error) {
+        state.models = null;
+        fillSelect(ui.modelSelect, [{ value: '', label: '（后端未连接）' }], '');
+        fillSelect(ui.mirrorSelect, [{ value: '', label: '（后端未连接）' }], '');
+        ui.modelNote.textContent = '模型管理需要后端在跑。';
+        ui.mirrorNote.textContent = '';
+        log('拉取模型列表失败', error);
+        return false;
+    }
+}
+
+function renderDownloadJob(job) {
+    const percent = Math.max(0, Math.min(100, Number(job.percent ?? 0)));
+    ui.downloadBar.style.width = `${percent}%`;
+
+    const size = job.totalBytes > 0
+        ? `${formatBytes(job.doneBytes)} / ${formatBytes(job.totalBytes)}`
+        : '';
+    ui.downloadState.textContent = [job.message ?? job.state, `${percent.toFixed(1)}%`, size]
+        .filter(Boolean).join(' · ');
+    if (job.error) {
+        ui.downloadState.textContent += ` — ${job.error}`;
+    }
+}
+
+function stopDownloadPolling() {
+    if (state.downloadTimer !== null) {
+        clearInterval(state.downloadTimer);
+        state.downloadTimer = null;
+    }
+}
+
+async function pollDownload() {
+    try {
+        const { job } = await transport.downloadStatus();
+        if (!job) {
+            ui.downloadState.textContent = '没有进行中的下载。';
+            stopDownloadPolling();
+            ui.downloadButton.disabled = false;
+            ui.cancelDownloadButton.disabled = true;
+            return;
+        }
+
+        renderDownloadJob(job);
+
+        if (job.state === 'done') {
+            stopDownloadPolling();
+            ui.downloadButton.disabled = false;
+            ui.cancelDownloadButton.disabled = true;
+            await refreshModels();
+            ui.downloadState.textContent = `${job.model} 下载完成。`;
+        } else if (job.state === 'failed' || job.state === 'cancelled') {
+            stopDownloadPolling();
+            ui.downloadButton.disabled = false;
+            ui.cancelDownloadButton.disabled = true;
+        }
+    } catch (error) {
+        stopDownloadPolling();
+        ui.downloadButton.disabled = false;
+        ui.cancelDownloadButton.disabled = true;
+        ui.downloadState.textContent = `查询下载状态失败：${error?.message ?? error}`;
+    }
+}
+
+async function onDownloadModelClicked() {
+    clearError();
+
+    // 先看后端在不在，再看选没选模型 —— 「请先选模型」只在列表都拿到了
+    // 却没选中时才有意义；后端没跑时给出真正的原因。
+    if (state.models === null) {
+        showError('下载模型需要后端在跑。\n'
+            + '请先在下面「独立后端」一栏生成安装脚本并运行一次，'
+            + '或者用插件提供的启动脚本把后端跑起来，然后点「刷新」。');
+        return;
+    }
+
+    const model = selectedModel();
+    if (model === null) {
+        showError('请先选择要下载的模型。');
+        return;
+    }
+
+    if (model.installed) {
+        ui.downloadState.textContent = `${model.id} 已经装好了，无需重复下载。`;
+        return;
+    }
+
+    try {
+        ui.downloadButton.disabled = true;
+        ui.cancelDownloadButton.disabled = false;
+        ui.downloadState.textContent = '正在提交下载任务…';
+
+        await transport.downloadModel(model.id, { mirror: ui.mirrorSelect.value });
+
+        stopDownloadPolling();
+        state.downloadTimer = setInterval(pollDownload, 1000);
+        await pollDownload();
+    } catch (error) {
+        ui.downloadButton.disabled = false;
+        ui.cancelDownloadButton.disabled = true;
+        showError(String(error?.message ?? error));
+    }
+}
+
+async function onCancelDownloadClicked() {
+    try {
+        await transport.cancelDownload();
+        ui.downloadState.textContent = '正在取消…';
+    } catch (error) {
+        showError(String(error?.message ?? error));
+    }
+}
+
+// ------------------------------------------------------- 生成后端安装脚本
+
+function downloadTextFile(filename, content) {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+/**
+ * 生成「一键安装后端」的脚本。
+ *
+ * 浏览器沙箱里没法建 venv / 跑 pip / 往任意目录写文件，所以这里能做到的上限是：
+ * 把**随包携带的后端源码**读出来，打成脚本让用户双击一次。
+ * 源码直接从这个扩展自己的目录取（fetch 自己的静态文件），不需要 git，也不用联网。
+ */
+async function onGenerateInstallerClicked() {
+    clearError();
+
+    const targetDir = (ui.installDir.value ?? '').trim();
+    if (targetDir === '') {
+        showError('请先填写要安装到哪个目录，例如 D:\\jev-backend');
+        ui.installDir.focus();
+        return;
+    }
+
+    ui.installHint.textContent = '正在读取随包的后端源码…';
+
+    try {
+        const files = [];
+        for (const name of BACKEND_FILES) {
+            const response = await fetch(new URL(name, BACKEND_SOURCE_BASE));
+            if (!response.ok) {
+                throw new Error(`取不到 ${name}（HTTP ${response.status}）`);
+            }
+            files.push({ path: name, content: await response.text() });
+        }
+
+        const { filename, content } = buildInstaller({ targetDir, files });
+        downloadTextFile(filename, content);
+
+        ui.installHint.textContent = `已生成 ${filename}（在浏览器下载目录里）。`
+            + '把它放到任意位置双击运行一次即可。'
+            + '装完之后回到这里点「预热后端」，状态灯变绿就能用了。';
+    } catch (error) {
+        ui.installHint.textContent = '';
+        const inStPluginsLayout = !location.pathname.includes('/third-party/');
+        showError(`生成安装脚本失败：${error?.message ?? error}`
+            + (inStPluginsLayout
+                ? '\n（看起来是原版 SillyTavern：后端由 install.mjs 装在 plugins/ 里，通常不需要这一步）'
+                : ''));
+    }
+}
+
 function onClearCacheClicked() {
     store.clearAll(context.chatMetadata);
     context.saveMetadataDebounced();
     refreshAllFloors();
     renderPreview();
-    showSummary(0, 0, 0);
+    refreshSummary();
     ui.progressText.textContent = '已清除本聊天的检查结果。';
     clearError();
+}
+
+// ------------------------------------------------------------ 点击修改句子
+
+/**
+ * 点聊天区里的高亮句子 → 打开小编辑器。
+ *
+ * 注意要同时认 `jev-mark` 与 `custom-jev-mark`：ST 的 DOMPurify 钩子
+ * 会给消息 HTML 里的 class 加 `custom-` 前缀（public/scripts/chats.js:1921-1933），
+ * 所以经过重新渲染的那批标记类名是带前缀的。
+ */
+function onChatClicked(event) {
+    const mark = event.target?.closest?.('mark.jev-mark, mark.custom-jev-mark');
+    if (!mark) {
+        return;
+    }
+
+    const mesElement = mark.closest('.mes[mesid]');
+    if (!mesElement) {
+        return;
+    }
+
+    const messageId = Number(mesElement.getAttribute('mesid'));
+    if (!Number.isInteger(messageId)) {
+        return;
+    }
+
+    const text = mark.textContent ?? '';
+    if (text === '') {
+        return;
+    }
+
+    openEditDialog({ messageId, swipeId: currentSwipeId(messageId), text });
+}
+
+/** 勾了「不再询问」就只留一个保存按钮，行为固定为「保存并取消标记」。 */
+function syncEditButtons() {
+    const always = ui.edit.alwaysUnmark.checked;
+    ui.edit.keepButton.classList.toggle('jev-hidden', always);
+    ui.edit.unmarkButton.textContent = always ? '保存' : '保存并取消标记';
+}
+
+function openEditDialog(target) {
+    state.editing = target;
+
+    ui.edit.where.textContent = `楼层 #${target.messageId} · 滑动 ${target.swipeId}`;
+    ui.edit.original.textContent = target.text;
+    ui.edit.text.value = target.text;
+    ui.edit.alwaysUnmark.checked = Boolean(settings.autoUnmarkAfterEdit);
+    ui.edit.error.classList.add('jev-hidden');
+    ui.edit.error.textContent = '';
+    syncEditButtons();
+
+    ui.edit.overlay.classList.remove('jev-hidden');
+    setTimeout(() => ui.edit.text.focus(), 30);
+}
+
+function hideEditDialog() {
+    state.editing = null;
+    ui.edit.overlay.classList.add('jev-hidden');
+}
+
+function showEditError(message) {
+    ui.edit.error.textContent = message;
+    ui.edit.error.classList.remove('jev-hidden');
+}
+
+/** 从缓存里删掉某楼层的一条句子（按文本匹配），用于「取消标记」。 */
+function forgetSentence(messageId, sentenceText) {
+    const entry = store.readFloor(context.chatMetadata, messageId);
+    if (entry === null || !Array.isArray(entry.sentences)) {
+        return;
+    }
+    const before = entry.sentences.length;
+    entry.sentences = entry.sentences.filter(item => item?.text !== sentenceText);
+    if (entry.sentences.length !== before) {
+        context.saveMetadataDebounced();
+    }
+}
+
+/**
+ * 应用编辑。
+ *
+ * 只替换**当前这个 swipe** 里的内容 —— 也就是检查时复制出来的那份副本，
+ * 原文（swipe[0]）一动不动。找不到原句时宁可报错，也不猜着改坏正文。
+ */
+async function applyEdit({ unmark }) {
+    const target = state.editing;
+    if (target === null) {
+        return;
+    }
+
+    const replacement = ui.edit.text.value;
+    if (replacement.trim() === '') {
+        showEditError('不能改成空内容。');
+        return;
+    }
+
+    const message = getMessage(target.messageId);
+    if (message === null) {
+        showEditError('这条楼层已经不存在了。');
+        return;
+    }
+
+    const ok = swipes.replaceSentenceInSwipe(message, target.swipeId, target.text, replacement);
+    if (!ok) {
+        showEditError('在正文里找不到这一句的原文（可能含有格式标记）。\n'
+            + '为避免改坏内容，这里不做替换。可以在酒馆里用编辑功能手工改。');
+        return;
+    }
+
+    // 勾了「不再询问」就一律取消标记 —— 与按钮语义保持一致，不留模糊地带
+    const finalUnmark = unmark || Boolean(settings.autoUnmarkAfterEdit);
+
+    // 记住用户的选择：以后不再问
+    if (ui.edit.alwaysUnmark.checked) {
+        settings.autoUnmarkAfterEdit = true;
+        context.saveSettingsDebounced();
+    }
+
+    if (finalUnmark) {
+        forgetSentence(target.messageId, target.text);
+    } else {
+        // 保留标记 → 把缓存里的句子文本同步成新文本，高亮才不会失配
+        const entry = store.readFloor(context.chatMetadata, target.messageId);
+        const sentence = entry?.sentences?.find(item => item?.text === target.text);
+        if (sentence) {
+            sentence.text = replacement;
+            context.saveMetadataDebounced();
+        }
+    }
+
+    hideEditDialog();
+
+    // 让酒馆重绘这条楼层
+    if (typeof context.addOneMessage === 'function') {
+        context.addOneMessage(message, { forceId: target.messageId, type: 'swipe' });
+    }
+
+    await refreshBackendStatus().catch(() => {});
+    setTimeout(() => {
+        applyToDom([target.messageId]);
+        refreshSummary();
+    }, 50);
 }
 
 async function onRunClicked() {
@@ -720,7 +1438,10 @@ function registerSettingsPanel() {
             </div>
             <div class="inline-drawer-content">
                 <div class="jev-settings-help">
-                    用 JEVnovel 2 · 0.8B 对选中的楼层做逐句质检，把「需要修改」的句子高亮出来。
+                    逐句质检的<b>使用入口在聊天输入框上方</b>的「JEV 句子质检」按钮里，
+                    那里集中了楼层、阈值、排除标签、模型管理与后端安装。
+                    <br>
+                    这一栏只放<b>连接相关</b>的设置 —— 平时用默认值就行。
                     结果保存在当前聊天里，不会修改消息原文。
                 </div>
 
@@ -739,7 +1460,6 @@ function registerSettingsPanel() {
 
                 <div class="jev-row">
                     <button class="menu_button" id="jev_probe">测试连接</button>
-                    <button class="menu_button" id="jev_clear_all">清除本聊天结果</button>
                 </div>
                 <div class="jev-hint" id="jev_probe_result"></div>
             </div>
@@ -787,39 +1507,67 @@ function registerSettingsPanel() {
             ? `连接成功：${info.mode} → ${info.base}`
             : `连接失败：\n${info.error}`;
     });
-
-    wrapper.querySelector('#jev_clear_all').addEventListener('click', () => {
-        store.clearAll(context.chatMetadata);
-        context.saveMetadataDebounced();
-        refreshAllFloors();
-    });
 }
 
 // ------------------------------------------------------------------ 入口
 
-function registerMenuButton() {
-    const menu = document.getElementById('extensionsMenu');
-    if (menu === null) {
-        log('没有找到 extensionsMenu，跳过菜单按钮。');
+/**
+ * 入口按钮放在**输入框上方自建的一行**里，而不是塞进顶部魔棒的下拉菜单。
+ *
+ * 做法与 ST 的 quick-reply 一样：`#send_form` 是输入区总容器，
+ * 把新行插到它的第一个子节点之前，就得到「输入框上方的一条横栏」。
+ * 参考 public/scripts/extensions/quick-reply/src/ui/ButtonUi.js:39-45。
+ *
+ * 样式用 `.menu_button`，跟着主题走，不会显得像外来户。
+ */
+function registerEntryButton() {
+    const sendForm = document.getElementById('send_form');
+    if (sendForm === null) {
+        log('没有找到 #send_form，退回放进扩展菜单。');
+        registerMenuButtonFallback();
         return;
     }
 
+    const bar = element('div', 'jev-entry-bar');
+    bar.id = 'jev_entry_bar';
+
+    const button = element('div', 'menu_button jev-entry-button');
+    button.id = 'jev_entry_button';
+    button.title = '对选中的楼层做逐句质检（JEVnovel 2）';
+    button.innerHTML = `
+        <span class="fa-solid fa-magnifying-glass-chart"></span>
+        <span>JEV 句子质检</span>
+    `;
+    button.addEventListener('click', () => {
+        showDialog();
+    });
+
+    bar.appendChild(button);
+
+    const firstChild = sendForm.children.length > 0 ? sendForm.children[0] : null;
+    if (firstChild !== null) {
+        firstChild.insertAdjacentElement('beforebegin', bar);
+    } else {
+        sendForm.appendChild(bar);
+    }
+}
+
+/** 极少数布局里没有 #send_form —— 这时退回魔棒下拉，至少有个入口。 */
+function registerMenuButtonFallback() {
+    const menu = document.getElementById('extensionsMenu');
+    if (menu === null) {
+        log('连扩展菜单也没有，入口按钮没地方放。');
+        return;
+    }
     const button = element('div', 'list-group-item flex-container flexGap5');
     button.id = 'jev_menu_button';
-    button.title = '用 JEVnovel 2 检查选中楼层的句子质量';
     button.innerHTML = `
         <div class="fa-solid fa-magnifying-glass-chart extensionsMenuExtensionButton"></div>
         <span>JEV 句子质检</span>
     `;
     button.addEventListener('click', () => {
         showDialog();
-        // 点完收起扩展菜单浮层，避免挡住对话框
-        const popup = document.getElementById('extensionsMenu');
-        if (popup !== null) {
-            popup.style.display = 'none';
-        }
     });
-
     menu.appendChild(button);
 }
 
@@ -841,6 +1589,19 @@ function registerEvents() {
     }
 }
 
+/**
+ * 点击编辑要挂在 #chat 上做事件委托：消息会被反复重绘，
+ * 逐条绑监听器一定会漏，而且和 ST 自己的委托（比如删除模式）冲突。
+ */
+function registerChatClickHandler() {
+    const chat = document.getElementById('chat');
+    if (chat === null) {
+        log('没有找到 #chat，点击编辑不可用。');
+        return;
+    }
+    chat.addEventListener('click', onChatClicked);
+}
+
 // ------------------------------------------------------------------ 生命周期
 
 export async function init() {
@@ -860,9 +1621,10 @@ export async function init() {
     });
 
     buildDialog();
-    registerMenuButton();
+    registerEntryButton();
     registerSettingsPanel();
     registerHighlightHook();
+    registerChatClickHandler();
     registerEvents();
 
     // hook 只覆盖「之后」的渲染，已经渲染好的楼层要主动补一次
@@ -872,18 +1634,24 @@ export async function init() {
     log('扩展已加载。');
 }
 
-/** 扩展被停用时清掉自己加的高亮，避免留下没有来源的红色标记。 */
+/** 扩展被停用时清掉自己加的高亮与 DOM，避免留下没有来源的痕迹。 */
 export async function onDisable() {
     clearRefreshTimers();
+    stopDownloadPolling();
 
     try {
         const root = document.getElementById('chat');
         if (root !== null) {
+            root.removeEventListener('click', onChatClicked);
             for (const textElement of root.querySelectorAll('.mes_text')) {
                 clearHighlights(textElement);
             }
         }
+        document.getElementById('jev_entry_bar')?.remove();
+        document.getElementById('jev_menu_button')?.remove();
+        ui?.overlay?.remove();
+        ui?.edit?.overlay?.remove();
     } catch (error) {
-        log('清理高亮失败', error);
+        log('清理失败', error);
     }
 }
