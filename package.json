@@ -1,6 +1,6 @@
 {
   "name": "sillytavern-jev-sentence-check",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "description": "SillyTavern extension: sentence-level AI-cliche detection using the JEVnovel 2 0.8B classifier, running locally on your own GPU.",

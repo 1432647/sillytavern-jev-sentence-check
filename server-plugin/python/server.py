@@ -49,34 +49,51 @@ def log(message: str) -> None:
 
 
 class Service:
-    """把运行时包成一组 op，stdio 与 http 两种传输层共用。"""
+    """把运行时包成一组 op，stdio 与 http 两种传输层共用。
 
-    def __init__(self, model_dir: str, device: str, batch_size: int, models_root: str | None = None):
-        self.runtime = JevRuntime(model_dir, device)
+    `model_dir` 允许为空——刚装好后端、还没下模型的全新环境必须能先把服务起起来：
+    模型下载由后端执行，后端起不来就永远下不了模型（鸡生蛋死锁）。
+    无模型时 health/模型管理正常工作，predict 给出可读报错。
+    """
+
+    def __init__(self, model_dir: str | Path | None, device: str, batch_size: int,
+                 models_root: str | None = None):
+        self.device = device
         self.batch_size = batch_size
         self._load_lock = threading.Lock()
         self._loading = False
         self._last_error: str | None = None
-        # 下载的模型放哪：显式给了就用，否则跟当前模型放同一层目录
-        self.models_root = str(Path(models_root).expanduser().resolve()) if models_root \
-            else str(self.runtime.model_dir.parent)
+
+        if model_dir:
+            resolved = Path(model_dir).expanduser().resolve()
+            self.models_root = str(Path(models_root).expanduser().resolve()) if models_root \
+                else str(resolved.parent)
+            self.runtime: JevRuntime | None = JevRuntime(resolved, device)
+        else:
+            # 未指定模型：默认落在 server.py 上两级的 models/（独立包布局正好是安装根）
+            self.models_root = str(Path(models_root).expanduser().resolve()) if models_root \
+                else str(Path(__file__).resolve().parent.parent.parent / "models")
+            self.runtime = None
         self.downloads = models.DownloadManager()
 
     # ------------------------------------------------------------------ ops
 
     def health(self) -> dict:
         return {
-            "ready": self.runtime.is_ready,
+            "ready": bool(self.runtime and self.runtime.is_ready),
             "loading": self._loading,
             "error": self._last_error,
-            "model_dir": str(self.runtime.model_dir),
-            "device": self.runtime.device,
+            "model_configured": self.runtime is not None,
+            "model_dir": str(self.runtime.model_dir) if self.runtime else "",
+            "device": self.device,
             "batch_size": self.batch_size,
             "cuda": cuda_report(),
         }
 
     def warmup(self) -> dict:
         """非阻塞预热：立刻返回 loading，权重在后台线程里加载。"""
+        if self.runtime is None:
+            return self.health()
         if self.runtime.is_ready:
             return self.health()
 
@@ -105,6 +122,11 @@ class Service:
         if not isinstance(sentences, list):
             raise JevRuntimeError("sentences 必须是数组。")
 
+        if self.runtime is None:
+            raise JevRuntimeError(
+                "后端还没有配置模型。请在总控面板「模型」一栏下载一个模型，"
+                "下载完成后重启后端即可。")
+
         # 首次 predict 会阻塞几秒到几十秒，这是预期内的
         if not self.runtime.is_ready:
             self.warmup()
@@ -124,7 +146,7 @@ class Service:
 
     def list_models(self) -> dict:
         """可选模型清单 + 本地是否已装 + 下载源。前端据此渲染下拉框。"""
-        current = str(self.runtime.model_dir)
+        current = str(self.runtime.model_dir) if self.runtime else ""
         entries = []
         for model in models.MODEL_REGISTRY:
             directory = models.model_dir(self.models_root, model["id"])
@@ -161,7 +183,8 @@ class Service:
         return {"job": self.downloads.cancel()}
 
     def shutdown(self) -> dict:
-        self.runtime.unload()
+        if self.runtime is not None:
+            self.runtime.unload()
         return {"bye": True}
 
 
@@ -421,7 +444,9 @@ def run_http(service: Service, host: str, port: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="JEVnovel 2 句子质检服务")
-    parser.add_argument("--model-dir", required=True, help="模型目录（含 config.json / infer.py）")
+    parser.add_argument("--model-dir", default=None,
+                        help="模型目录（含 config.json / infer.py）。省略时自动探测，"
+                             "探测不到则以「无模型」模式启动（供面板下载模型用）")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--stdio", action="store_true", help="以 JSONL 走 stdin/stdout（默认）")
@@ -435,6 +460,22 @@ def main() -> int:
 
     if args.batch_size < 1:
         parser.error("--batch-size 必须为正整数")
+
+    # 未指定模型时按注册表顺序自动探测已安装的（0.8B 优先）；
+    # 都没有就以「无模型」模式启动，让面板能完成首次模型下载。
+    if args.model_dir is None:
+        models_root = Path(args.models_root).expanduser().resolve() if args.models_root \
+            else Path(__file__).resolve().parent.parent.parent / "models"
+        args.models_root = str(models_root)
+        for model in models.MODEL_REGISTRY:
+            candidate = models.model_dir(str(models_root), model["id"])
+            if models.is_installed(str(models_root), model["id"]):
+                args.model_dir = str(candidate)
+                log(f"未指定 --model-dir，自动使用已安装的模型：{candidate}")
+                break
+        if args.model_dir is None:
+            log(f"未指定 --model-dir 且 {models_root} 下没有已安装的模型，"
+                f"以「无模型」模式启动。")
 
     service = Service(args.model_dir, args.device, args.batch_size, models_root=args.models_root)
 

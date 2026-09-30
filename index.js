@@ -22,7 +22,7 @@ import { clearHighlights, highlightElement } from './lib/highlight-dom.js';
 import * as store from './lib/store.js';
 import { MODES, createTransport } from './lib/transport.js';
 import * as swipes from './lib/swipes.js';
-import { BACKEND_FILES, buildInstaller } from './lib/backend-install.js';
+import { BACKEND_FILES, LAUNCHER_FILES, buildInstaller } from './lib/backend-install.js';
 
 const MARK_CLASS = 'jev-mark';
 const MAX_FLOORS_PER_RUN = 50;
@@ -1241,16 +1241,28 @@ async function onGenerateInstallerClicked() {
             files.push({ path: name, content: await response.text() });
         }
 
+        // 启动器落在安装根（不进 server/），这样它能按自己的布局探测到 venv 与模型
+        const rootFiles = [];
+        for (const name of LAUNCHER_FILES) {
+            const response = await fetch(new URL(`./server-plugin/${name}`, import.meta.url));
+            if (!response.ok) {
+                throw new Error(`取不到 ${name}（HTTP ${response.status}）`);
+            }
+            rootFiles.push({ path: name, content: await response.text() });
+        }
+
         const { filename, content } = buildInstaller({
             targetDir,
             files,
+            rootFiles,
             deviceKind: settings.lastDeviceKind === 'cpu' ? 'cpu' : 'gpu',
         });
         downloadTextFile(filename, content);
 
         ui.installHint.textContent = `已生成 ${filename}（在浏览器下载目录里）。`
-            + '把它放到任意位置双击运行一次即可。'
-            + '装完之后回到这里点「预热后端」，状态灯变绿就能用了。';
+            + '把它放到任意位置双击运行一次即可——脚本会装好后端和启动器，'
+            + '之后在安装目录里运行 node start-backend.mjs 启动。'
+            + '没模型也能启动，先到面板「模型」一栏下载，再重启一次后端。';
     } catch (error) {
         ui.installHint.textContent = '';
         const inStPluginsLayout = !location.pathname.includes('/third-party/');
