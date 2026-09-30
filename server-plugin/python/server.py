@@ -224,12 +224,17 @@ class HttpHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         origin = self.headers.get("Origin")
+
+        # 无论最终是否放行这个来源，都要先把请求体读干净。
+        # 否则 keep-alive 连接上会残留未读字节，下一次读取会读到上一个请求的尾巴，
+        # 表现为一堆 ConnectionResetError 栈。
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+
         if not _origin_allowed(origin):
             self._send(403, {"ok": False, "error": "origin not allowed"}, origin)
             return
 
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
         try:
             request = json.loads(raw.decode("utf-8") or "{}")
         except Exception as exc:  # noqa: BLE001
@@ -254,9 +259,23 @@ class HttpHandler(BaseHTTPRequestHandler):
             self._send(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, origin)
 
 
+class QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """客户端提前断开（浏览器刷新、取消请求、健康检查探针）不该甩一屏栈。
+
+    这类网络噪音会把它上面的真实报错淹掉，所以只对连接类异常静默，
+    其他异常照常交给父类打印。
+    """
+
+    def handle_error(self, request, client_address) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def run_http(service: Service, host: str, port: int) -> int:
     HttpHandler.service = service
-    server = ThreadingHTTPServer((host, port), HttpHandler)
+    server = QuietThreadingHTTPServer((host, port), HttpHandler)
     log(f"http 模式就绪：http://{host}:{port}/  （/health, /predict, /warmup）")
     try:
         server.serve_forever()

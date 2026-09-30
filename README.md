@@ -41,41 +41,48 @@
 | 模式 | 什么时候用 | 说明 |
 |---|---|---|
 | `st-plugin` | 原版 SillyTavern | 由 `plugins/jev-sentence-check/` 托管并守护 Python 子进程。不占端口、无 CORS，进程随 ST 一起退出 |
-| `direct` | TauriTavern，或其他没有服务端插件加载器的环境 | 手工启动独立服务（`start-backend.cmd`），前端直连 `127.0.0.1:8791` |
-| `auto`（默认） | 都行 | 先探 `st-plugin`，404 就降级到 `direct` |
+| `direct` | **TauriTavern**，或其他没有服务端插件加载器的环境 | 手工启动独立 HTTP 服务（`server-plugin/start-backend.mjs`），前端直连 `127.0.0.1:8791` |
+| `auto`（默认） | 都行 | 先探 `st-plugin`；探测失败、或响应结构不像本后端，就降级到 `direct` |
 
 > 为什么需要 `direct`：TauriTavern 是 SillyTavern 的 fork，前端扩展机制保留，
-> 但它**没有** Express 的 `plugin-loader`，`/api/plugins/*` 是路由层硬编码的内置插件，
+> 但它**没有** Express 的 `plugin-loader` —— 它的 `/api/plugins/*` 是路由层硬编码的内置插件，
 > 装进 `plugins/` 的 Node 插件不会被加载。所以那里只能走 `direct`。
 
 ---
 
 ## 目录结构
 
+**仓库根目录就是扩展本身。** 这不是风格选择：TauriTavern 与 SillyTavern 的
+「从 git URL 安装扩展」都会克隆整个仓库，并要求 `manifest.json` 位于**仓库根**。
+放进子目录（比如 `extension/manifest.json`）会直接报
+`Validation error: Extension manifest.json is missing`。
+
 ```
 sillytavern-jev-sentence-check/
-├── install.mjs / uninstall.mjs     安装 / 卸载
-├── extension/                      前端扩展 → public/scripts/extensions/third-party/
-│   ├── manifest.json
-│   ├── index.js
-│   ├── style.css
-│   └── lib/
-│       ├── sentence-splitter.js    分句器（纯函数）
-│       ├── floor-parser.js         楼层表达式解析（纯函数）
-│       ├── highlight.js            HTML 纯文本层定位 + 包裹 <mark>（字符串版，给渲染 hook）
-│       ├── highlight-dom.js        就地 DOM 包裹（TreeWalker + Range，保住既有监听器）
-│       ├── store.js                chat_metadata 缓存读写（纯函数）
-│       └── transport.js            后端传输层 + 自动降级
-└── server-plugin/                  服务端插件 → plugins/
-    ├── index.mjs                   Express 路由 + Python 子进程守护
-    └── python/
-        ├── server.py               stdio JSONL / HTTP 双入口
-        ├── jev_runtime.py          模型加载、批量推理、超长兜底、OOM 降档
-        └── requirements.txt
+├── manifest.json               ┐
+├── index.js                    │ 扩展本体
+├── style.css                   │ （安装时复制到 extensions/third-party/jev-sentence-check/）
+├── lib/                        ┘
+│   ├── sentence-splitter.js       分句器（纯函数）
+│   ├── floor-parser.js            楼层表达式解析（纯函数）
+│   ├── highlight.js               HTML 纯文本层定位 + 包裹 <mark>（字符串版，给渲染 hook）
+│   ├── highlight-dom.js           就地 DOM 包裹（TreeWalker + Range，保住既有监听器）
+│   ├── store.js                   chat_metadata 缓存读写（纯函数）
+│   └── transport.js               后端传输层 + 自动降级
+├── server-plugin/             后端
+│   ├── index.mjs                  Express 路由 + Python 子进程守护（仅原版 ST 走这条）
+│   ├── start-backend.mjs          独立后端启动器（TauriTavern / 手工调试）
+│   └── python/
+│       ├── server.py              stdio JSONL / HTTP 双入口
+│       ├── jev_runtime.py         模型加载、批量推理、超长兜底、OOM 降档
+│       └── requirements.txt
+├── install.mjs / uninstall.mjs    原版 SillyTavern 的一键安装 / 卸载
+└── README.md
 ```
 
-> 本仓库只发布**插件本体与安装脚本**。本地开发包另含 `test/`（JS 124 个 + Python 19 个单测）
+> 本仓库只发布**插件本体、后端与安装脚本**。本地开发包另含 `test/`（JS 127 个 + Python 19 个单测）
 > 与 `docs/DESIGN.md`（设计文档，含 SillyTavern 内部 API 的实测依据），未一并发布。
+
 
 ---
 
@@ -83,14 +90,69 @@ sillytavern-jev-sentence-check/
 
 ### 前置条件
 
-- SillyTavern 1.19.0 或更新
-- Node.js ≥ 20（SillyTavern 自身要求）
+- **TauriTavern**（任意版本）或 **SillyTavern 1.19.0+**
+- Node.js ≥ 20
 - NVIDIA GPU，支持 bf16（模型**强制要求 CUDA**，不是可选加速）
 - Python 3.11+
+- 磁盘：CUDA 版 torch 约 2.7 GB（解压后 4 GB+），模型约 1.5 GB
 
-### 步骤
+### 第 1 步：建 Python 环境（两个客户端都要）
 
-**1. 装 SillyTavern 依赖并生成配置**
+最省事的做法 —— 一条命令搞定建环境 + 装依赖：
+
+```bash
+git clone https://github.com/1432647/sillytavern-jev-sentence-check.git
+cd sillytavern-jev-sentence-check
+node server-plugin/start-backend.mjs --setup
+```
+
+它会在**用户数据目录**建一个共享虚拟环境
+（Windows：`%LOCALAPPDATA%\jev-sentence-check\venv`，macOS/Linux 对应各自的用户数据目录）。
+刻意不放在仓库里 —— TauriTavern 更新扩展时会清空克隆目录（只保留 `.git`），放里面会被一起删掉。
+
+想自己控制位置就手动来：
+
+```bash
+python -m venv <venv 路径>
+<venv>/Scripts/python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+<venv>/Scripts/python.exe -m pip install transformers==5.17.0 safetensors==0.8.0
+```
+
+> CUDA 版 torch 的 wheel 有 **2.7 GB**，Windows 上解压二三十分钟属正常。
+>
+> 模型仓库 `requirements.txt` 里的 `flash-linear-attention` / `tilelang` / `causal-conv1d`
+> **不需要装** —— 模型自带的 `infer.py` 只 import `torch` / `safetensors` / `transformers`，
+> 实测 transformers 会自动回退到参考 PyTorch 实现并正常出结果。
+> 只有当你想把单句耗时从 ~190 ms 再压下去时，才值得去折腾那几个优化内核。
+
+### 第 2 步：装扩展
+
+#### A. TauriTavern
+
+用「从 Git URL 安装扩展」，填仓库地址：
+
+```
+https://github.com/1432647/sillytavern-jev-sentence-check
+```
+
+它会克隆整个仓库并读取**仓库根**的 `manifest.json`。
+
+然后**手工起后端** —— TauriTavern 没有服务端插件加载器，扩展自己拉不起 Python：
+
+```bash
+node server-plugin/start-backend.mjs
+```
+
+保持这个窗口开着。日志出现「模型已就绪」后，回到聊天页点扩展菜单里的「JEV 句子质检」，
+状态灯会显示 `direct`，直接开始检查即可。
+
+> 启动器会自动探测 Python 与模型。探测不到就用 `--python <路径> --model <模型目录>`，
+> 或设环境变量 `JEV_PYTHON` / `JEV_MODEL`。服务固定监听 `127.0.0.1:8791`，
+> 需要改端口用 `--port`，并同步改扩展设置里的「独立服务地址」。
+
+#### B. 原版 SillyTavern
+
+先让 ST 自己初始化一次：
 
 ```bash
 cd SillyTavern
@@ -98,29 +160,9 @@ npm install
 node server.js        # 首次启动会生成 config.yaml，然后 Ctrl+C 退出
 ```
 
-**2. 建 Python 环境**
-
-以下命令在**本仓库目录里**执行：
-
-```bash
-python -m venv runtime/venv
-runtime/venv/Scripts/python.exe -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-runtime/venv/Scripts/python.exe -m pip install transformers==5.17.0 safetensors==0.8.0
-```
-
-> CUDA 版 torch 的 wheel 有 **2.7 GB**，在 Windows 上解压可能要二三十分钟，属正常。
->
-> 模型仓库的 `requirements.txt` 里还有 `flash-linear-attention` / `tilelang` /
-> `causal-conv1d`。那三件在 Windows 上编译风险很高，而模型自带的 `infer.py`
-> 本身只 import `torch` / `safetensors` / `transformers`。
-> **先只装这三件** —— 实测 transformers 会自动回退到参考 PyTorch 实现，跑得通；
-> 只有当你想把单句耗时从 ~190ms 再压下去时，才需要去折腾那几个优化内核。
-
-**3. 安装扩展**
-
 > ⚠️ **覆盖安装前请先完全退出 SillyTavern。**
 > Python 推理子进程会占住 `plugins/jev-sentence-check/python/` 目录，
-> ST 还在跑时覆盖会失败（`EBUSY`）。这是实测撞到过的坑，安装脚本会给出提示但不会替你退出 ST。
+> ST 还在跑时覆盖会失败（`EBUSY`）。安装脚本会给出提示，但不会替你退出 ST。
 
 ```bash
 node install.mjs --sillytavern <SillyTavern 路径>
@@ -128,17 +170,18 @@ node install.mjs --sillytavern <SillyTavern 路径>
 
 脚本会：
 
-- 把 `extension/` 复制到 `public/scripts/extensions/third-party/jev-sentence-check/`
+- 把扩展本体（`manifest.json` / `index.js` / `style.css` / `lib/`）复制到
+  `public/scripts/extensions/third-party/jev-sentence-check/`
 - 把 `server-plugin/` 复制到 `plugins/jev-sentence-check/`
-- 写入带绝对路径的 `config.json` 与 `start-backend.cmd`
+- 写入带绝对路径的 `config.json`
 - 把 `config.yaml` 的 `enableServerPlugins` 改成 `true`（已经是 `true` 就不动）
 
-**4. 启动并使用**
+### 第 3 步：用起来
 
-1. 启动 SillyTavern，页面刷新后打开扩展菜单（输入框上方的 ⋮）
-2. 点「JEV 句子质检」
-3. 点一次「预热后端」，等到状态灯变绿（首次要加载 1.4GiB 权重）
-4. 填楼层号 → 「开始检查」→ 高亮出现
+1. 打开扩展菜单（聊天输入框上方的 ⋮）→ 点「JEV 句子质检」
+2. 点一次「预热后端」，等到状态灯变绿（首次要加载约 1.4 GiB 权重）
+3. 填楼层号 → 「开始检查」→ 高亮出现
+
 
 ---
 
@@ -189,12 +232,16 @@ SillyTavern 默认不显示这个编号，可以在「用户设置」里打开
 
 | 现象 | 排查方向 |
 |---|---|
-| 状态灯红，提示「找不到后端」 | 原版 ST：确认 `config.yaml` 里 `enableServerPlugins: true` 且已重启。其他环境：先跑 `start-backend.cmd` |
+| 安装时报 `Extension manifest.json is missing` | `manifest.json` 必须在**仓库根目录**。别把它挪进 `extension/` 之类的子目录 —— 安装器只认根目录 |
+| 状态灯红，提示「找不到后端」 | TauriTavern：先跑 `node server-plugin/start-backend.mjs` 并确认窗口还开着。原版 ST：确认 `config.yaml` 里 `enableServerPlugins: true` 且已重启 |
+| 状态灯显示 `direct` 而不是 `st-plugin` | 说明服务端插件路由没探测到，走了直连。TauriTavern 下这是**正常且预期**的 |
 | 「后端加载失败：...CUDA...」 | 模型强制要求 CUDA + bf16。确认 `nvidia-smi` 正常、装的是 CUDA 版 torch 而不是 CPU 版 |
-| 「找不到 Python 解释器」 | 跑一次 `install.mjs` 重新写 `config.json`，或检查 `runtime/venv` 是否存在 |
-| 预热卡很久 | 首次要加载 1.4GiB 权重，正常要几十秒。`/api/plugins/jev-sentence-check/logs` 能看到子进程日志 |
-| 少数句子没高亮 | 分句结果与渲染后的 HTML 纯文本层不一致时会跳过。这类句子会保留在缓存里，可在这层排查 |
+| 「找不到 Python 解释器」 | 原版 ST：重跑 `install.mjs` 重写 `config.json`。TauriTavern：`start-backend.mjs --python <路径>`，或先跑 `--setup` |
+| 找不到模型目录 | 用 `--model <路径>` 或环境变量 `JEV_MODEL` 指定。模型来自 ModelScope：`alkaid55555/jev-novel-2-0.8b-bf16` |
+| 预热卡很久 | 首次要加载约 1.4 GiB 权重，几十秒正常。原版 ST 可在 `/api/plugins/jev-sentence-check/logs` 看子进程日志；直连模式直接看启动窗口 |
+| 少数句子没高亮 | 分句结果与渲染后 HTML 的纯文本层不一致时会跳过。这类句子仍保留在缓存里，可在这层排查 |
 | 显存不足 | 后端会自动砍半 batch 重试。仍失败就调小 `config.json` 里的 `batchSize` |
+| 端口 8791 被占 | 换 `--port 8792`，并同步改扩展设置面板里的「独立服务地址」 |
 
 ---
 

@@ -90,7 +90,8 @@ function detectModelDir() {
     return candidates[0];
 }
 
-function copyTree(source, target) {
+/** 清空目标目录并重建。被占用时给可读提示，而不是抛裸栈。 */
+function prepareTarget(target) {
     try {
         fs.rmSync(target, { recursive: true, force: true });
     } catch (error) {
@@ -103,7 +104,28 @@ function copyTree(source, target) {
         }
         throw error;
     }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+}
+
+// 仓库根目录就是扩展本身 —— TauriTavern 的 git 安装会克隆整个仓库并要求
+// manifest.json 位于**仓库根**（见其 file_extension_repository/git_worktree.rs），
+// 所以这里必须显式列举要部署的文件，不能把根目录整个复制过去
+// （否则 README / install.mjs / server-plugin / 测试都会被塞进扩展目录）。
+const EXTENSION_FILES = ['manifest.json', 'index.js', 'style.css'];
+const EXTENSION_DIRS = ['lib'];
+
+function deployExtension(target) {
+    prepareTarget(target);
+    for (const file of EXTENSION_FILES) {
+        fs.copyFileSync(path.join(HERE, file), path.join(target, file));
+    }
+    for (const dir of EXTENSION_DIRS) {
+        fs.cpSync(path.join(HERE, dir), path.join(target, dir), { recursive: true, force: true });
+    }
+}
+
+function copyTree(source, target) {
+    prepareTarget(target);
     fs.cpSync(source, target, {
         recursive: true,
         force: true,
@@ -144,14 +166,26 @@ function ensureServerPlugins(configPath, defaultConfigPath) {
     return { changed: true, needsManual: false };
 }
 
-function writeBackendLauncher(targetPath, pythonExe, serverScript, modelDir, port) {
+/**
+ * 生成 Windows 双击即可运行的快捷方式。
+ * 实际逻辑全部委托给跨平台的 server-plugin/start-backend.mjs ——
+ * 这里只负责把安装时探测到的路径传进去，避免用户再填一遍。
+ */
+function writeBackendLauncher(targetPath, repoRoot, pythonExe, modelDir, port) {
+    const launcher = path.join(repoRoot, 'server-plugin', 'start-backend.mjs');
     const content = [
         '@echo off',
-        'REM 由 install.mjs 生成，路径已写死为绝对路径，不要手改。',
-        'REM 用途：TauriTavern 等没有 SillyTavern 服务端插件加载器的环境，',
-        'REM 或者想在浏览器/终端里手工调试时，直接起这个独立服务。',
+        'REM 由 install.mjs 生成。实际逻辑在 server-plugin/start-backend.mjs，',
+        'REM 这个文件只是把安装时探测到的 Python 与模型路径传进去，方便双击运行。',
         '',
-        `"${pythonExe}" "${serverScript}" --model-dir "${modelDir}" --device cuda:0 --http --port ${port} --preload`,
+        'where node > nul 2> nul',
+        'if errorlevel 1 (',
+        '    echo 找不到 node。请先安装 Node.js 20+ 并确保它在 PATH 里。',
+        '    pause > nul',
+        '    exit /b 1',
+        ')',
+        '',
+        `node "${launcher}" --python "${pythonExe}" --model "${modelDir}" --port ${port}`,
         'echo.',
         'echo 服务已退出。按任意键关闭窗口。',
         'pause > nul',
@@ -208,9 +242,9 @@ function install() {
         process.exit(1);
     }
 
-    // 1. 前端扩展
+    // 1. 前端扩展（源码就在仓库根目录）
     const extensionTarget = path.join(stRoot, 'public', 'scripts', 'extensions', 'third-party', EXTENSION_DIR_NAME);
-    copyTree(path.join(HERE, 'extension'), extensionTarget);
+    deployExtension(extensionTarget);
     console.log(`[1/4] 前端扩展 → ${extensionTarget}`);
 
     // 2. 服务端插件
@@ -235,8 +269,8 @@ function install() {
     console.log(`      serverScript = ${serverScript}`);
     console.log(`      modelDir     = ${modelDir}`);
 
-    writeBackendLauncher(path.join(pluginTarget, 'start-backend.cmd'), pythonExe, serverScript, modelDir, 8791);
-    writeBackendLauncher(path.join(HERE, 'start-backend.cmd'), pythonExe, serverScript, modelDir, 8791);
+    // 只写进插件目录，不往仓库根写 —— 仓库是要被克隆的，别留未跟踪文件
+    writeBackendLauncher(path.join(pluginTarget, 'start-backend.cmd'), HERE, pythonExe, modelDir, 8791);
 
     // 4. config.yaml
     if (skipConfig) {
