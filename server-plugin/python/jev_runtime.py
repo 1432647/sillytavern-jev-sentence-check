@@ -139,8 +139,24 @@ class JevRuntime:
 
     # ------------------------------------------------------------------ 推理
 
-    def predict(self, sentences: list[str], batch_size: int = 8, include_ordinal: bool = False) -> list[dict]:
-        """对一组句子做判定。返回结果与入参一一对应。"""
+    def predict(self, sentences: list[str], batch_size: int = 8, include_ordinal: bool = False,
+                threshold: float | None = None) -> list[dict]:
+        """对一组句子做判定。返回结果与入参一一对应。
+
+        threshold 只重算 `needs_revision` / `label` 这两个**派生**字段；
+        `bad_probability` 始终原样返回 —— 前端因此可以直接拿已缓存的概率
+        按新阈值重算高亮，不必把整批句子重新过一遍 GPU。
+
+        刻意**不改** `predictor.threshold`：HTTP 服务是多线程的，
+        改共享状态会让并发请求互相串味。
+        """
+        if threshold is not None:
+            if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+                raise JevRuntimeError("threshold 必须是 0~1 之间的数。")
+            threshold = float(threshold)
+            if not 0.0 <= threshold <= 1.0:
+                raise JevRuntimeError("threshold 必须在 0~1 之间。")
+
         predictor = self.load()
 
         cleaned = [s if isinstance(s, str) else "" for s in sentences]
@@ -172,6 +188,10 @@ class JevRuntime:
         for index in range(len(results)):
             if results[index] is None:
                 results[index] = _empty_result()
+
+        if threshold is not None:
+            for item in results:
+                _apply_threshold(item, threshold)
 
         return results  # type: ignore[return-value]
 
@@ -234,6 +254,17 @@ def _is_oom(exc: Exception) -> bool:
     if name in {"OutOfMemoryError", "CudaOutOfMemoryError"}:
         return True
     return "out of memory" in str(exc).lower()
+
+
+def _apply_threshold(result: dict, threshold: float) -> None:
+    """按给定阈值重算派生字段，原地修改。概率字段保持不动。"""
+    probability = result.get("bad_probability")
+    if not isinstance(probability, (int, float)) or isinstance(probability, bool):
+        return
+    needs_revision = float(probability) >= threshold
+    result["needs_revision"] = needs_revision
+    result["label"] = "bad" if needs_revision else "not_bad"
+    result["threshold"] = threshold
 
 
 def _empty_result() -> dict:

@@ -2,7 +2,23 @@
 
 /* ---------------------------------------------- 消息正文里的高亮 */
 
-.mes_text mark.jev-mark {
+/*
+ * 必须同时匹配 `custom-jev-mark`。
+ *
+ * SillyTavern 的 DOMPurify 钩子会给消息 HTML 里的所有 class 加 `custom-` 前缀
+ * （public/scripts/chats.js:1921-1933，防止聊天内容伪造 UI 元素样式）：
+ *
+ *     jev-mark  →  custom-jev-mark
+ *
+ * 而我们的两条高亮路径只有一条会经过消毒：
+ *   - 检查完成后直接改 DOM（不过 DOMPurify）→ class 仍是 jev-mark
+ *   - 重新渲染走 messageFormatter hook（过 DOMPurify）→ class 变成 custom-jev-mark
+ *
+ * 只写前者的话，重新渲染后选择器失配，<mark> 会掉回浏览器默认样式（黄底），
+ * 表现为「编辑保存后标红变成黄色」。
+ */
+.mes_text mark.jev-mark,
+.mes_text mark.custom-jev-mark {
     background-color: rgba(220, 60, 60, 0.22);
     color: inherit;
     border-bottom: 1px dashed rgba(220, 60, 60, 0.75);
@@ -12,7 +28,9 @@
 }
 
 body.dark .mes_text mark.jev-mark,
-.dark .mes_text mark.jev-mark {
+body.dark .mes_text mark.custom-jev-mark,
+.dark .mes_text mark.jev-mark,
+.dark .mes_text mark.custom-jev-mark {
     background-color: rgba(255, 90, 90, 0.24);
     border-bottom-color: rgba(255, 120, 120, 0.8);
 }

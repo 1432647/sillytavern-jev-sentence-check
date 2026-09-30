@@ -25,6 +25,7 @@ import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 
 # 必须在 import torch 之前设置，见模型仓库 infer.py 的做法
@@ -33,8 +34,13 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("FLA_TILELANG", "1")
 
 from jev_runtime import JevRuntime, JevRuntimeError, cuda_report  # noqa: E402
+import models  # noqa: E402
 
 DEFAULT_BATCH_SIZE = 8
+
+#: 这些是我们自己抛的「可读错误」，给用户的提示不需要带类名前缀，
+#: 也不需要打栈（打出来只会淹没真正的问题）。
+EXPECTED_ERRORS = (JevRuntimeError, models.ModelError)
 
 
 def log(message: str) -> None:
@@ -45,12 +51,16 @@ def log(message: str) -> None:
 class Service:
     """把运行时包成一组 op，stdio 与 http 两种传输层共用。"""
 
-    def __init__(self, model_dir: str, device: str, batch_size: int):
+    def __init__(self, model_dir: str, device: str, batch_size: int, models_root: str | None = None):
         self.runtime = JevRuntime(model_dir, device)
         self.batch_size = batch_size
         self._load_lock = threading.Lock()
         self._loading = False
         self._last_error: str | None = None
+        # 下载的模型放哪：显式给了就用，否则跟当前模型放同一层目录
+        self.models_root = str(Path(models_root).expanduser().resolve()) if models_root \
+            else str(self.runtime.model_dir.parent)
+        self.downloads = models.DownloadManager()
 
     # ------------------------------------------------------------------ ops
 
@@ -90,7 +100,8 @@ class Service:
         finally:
             self._loading = False
 
-    def predict(self, sentences: list[str], include_ordinal: bool = False, batch_size: int | None = None) -> dict:
+    def predict(self, sentences: list[str], include_ordinal: bool = False, batch_size: int | None = None,
+                threshold: float | None = None) -> dict:
         if not isinstance(sentences, list):
             raise JevRuntimeError("sentences 必须是数组。")
 
@@ -100,12 +111,54 @@ class Service:
             self.runtime.load()
 
         size = batch_size if isinstance(batch_size, int) and batch_size > 0 else self.batch_size
-        results = self.runtime.predict(sentences, batch_size=size, include_ordinal=include_ordinal)
+        results = self.runtime.predict(sentences, batch_size=size, include_ordinal=include_ordinal,
+                                       threshold=threshold)
         return {
             "results": results,
             "count": len(results),
+            "threshold": threshold,
             "needs_revision": sum(1 for item in results if item.get("needs_revision")),
         }
+
+    # ------------------------------------------------------------- 模型管理
+
+    def list_models(self) -> dict:
+        """可选模型清单 + 本地是否已装 + 下载源。前端据此渲染下拉框。"""
+        current = str(self.runtime.model_dir)
+        entries = []
+        for model in models.MODEL_REGISTRY:
+            directory = models.model_dir(self.models_root, model["id"])
+            entries.append({
+                "id": model["id"],
+                "label": model["label"],
+                "note": model["note"],
+                "installed": models.is_installed(self.models_root, model["id"]),
+                "path": str(directory),
+                "isCurrent": str(directory) == current,
+                "repos": {"modelscope": model["modelscope"], "huggingface": model["huggingface"]},
+            })
+        return {
+            "models": entries,
+            "mirrors": [{"id": key, **value} for key, value in models.MIRRORS.items()],
+            "defaultMirror": models.DEFAULT_MIRROR,
+            "modelsRoot": self.models_root,
+            "currentModelDir": current,
+        }
+
+    def download_model(self, model_id: str, mirror: str | None = None, target_root: str | None = None,
+                       force: bool = False) -> dict:
+        return self.downloads.start(
+            model_id,
+            mirror or models.DEFAULT_MIRROR,
+            target_root or self.models_root,
+            force=force,
+        )
+
+    def download_status(self) -> dict:
+        return {"job": self.downloads.status()}
+
+    def cancel_download(self) -> dict:
+        return {"job": self.downloads.cancel()}
 
     def shutdown(self) -> dict:
         self.runtime.unload()
@@ -127,7 +180,21 @@ def dispatch(service: Service, request: dict) -> dict:
             request.get("sentences", []),
             include_ordinal=bool(request.get("include_ordinal", False)),
             batch_size=request.get("batch_size"),
+            threshold=request.get("threshold"),
         )
+    if op == "list_models":
+        return service.list_models()
+    if op == "download_model":
+        return service.download_model(
+            request.get("model", ""),
+            mirror=request.get("mirror"),
+            target_root=request.get("target_root"),
+            force=bool(request.get("force", False)),
+        )
+    if op == "download_status":
+        return service.download_status()
+    if op == "cancel_download":
+        return service.cancel_download()
     if op == "unload":
         return service.shutdown()
 
@@ -150,9 +217,13 @@ def handle_line(service: Service, line: str) -> dict | None:
         return {"id": request_id, "ok": True, "result": result}
     except Exception as exc:  # noqa: BLE001
         log(f"请求处理失败：{exc}")
-        if not isinstance(exc, JevRuntimeError):
+        if isinstance(exc, EXPECTED_ERRORS):
+            # 这类是我们自己抛的可读错误，原样透出，别加类名前缀
+            message = str(exc)
+        else:
+            message = f"{type(exc).__name__}: {exc}"
             log(traceback.format_exc())
-        return {"id": request_id, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"id": request_id, "ok": False, "error": message}
 
 
 def run_stdio(service: Service) -> int:
@@ -258,10 +329,20 @@ class HttpHandler(BaseHTTPRequestHandler):
         self._send(204, None, origin)
 
     def do_GET(self):  # noqa: N802
-        if self.path.rstrip("/") in ("/health", ""):
-            self._send(200, {"ok": True, "result": self.service.health()}, self.headers.get("Origin"))
+        origin = self.headers.get("Origin")
+        route = self.path.rstrip("/")
+
+        if route in ("/health", ""):
+            self._send(200, {"ok": True, "result": self.service.health()}, origin)
             return
-        self._send(404, {"ok": False, "error": "not found"}, self.headers.get("Origin"))
+        if route == "/models":
+            self._send(200, {"ok": True, "result": self.service.list_models()}, origin)
+            return
+        if route == "/download_status":
+            self._send(200, {"ok": True, "result": self.service.download_status()}, origin)
+            return
+
+        self._send(404, {"ok": False, "error": "not found"}, origin)
 
     def do_POST(self):  # noqa: N802
         origin = self.headers.get("Origin")
@@ -290,15 +371,22 @@ class HttpHandler(BaseHTTPRequestHandler):
             request.setdefault("op", "warmup")
         elif route == "/unload":
             request.setdefault("op", "unload")
+        elif route == "/download":
+            request.setdefault("op", "download_model")
+        elif route == "/cancel_download":
+            request.setdefault("op", "cancel_download")
 
         try:
             result = dispatch(self.service, request)
             self._send(200, {"ok": True, "result": result}, origin)
         except Exception as exc:  # noqa: BLE001
             log(f"http 请求处理失败：{exc}")
-            if not isinstance(exc, JevRuntimeError):
+            if isinstance(exc, EXPECTED_ERRORS):
+                message = str(exc)
+            else:
+                message = f"{type(exc).__name__}: {exc}"
                 log(traceback.format_exc())
-            self._send(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, origin)
+            self._send(500, {"ok": False, "error": message}, origin)
 
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -341,12 +429,14 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8791)
     parser.add_argument("--preload", action="store_true", help="启动时就在后台加载权重")
+    parser.add_argument("--models-root", default=None,
+                        help="新下载的模型放哪个目录（默认与当前模型同一层）")
     args = parser.parse_args()
 
     if args.batch_size < 1:
         parser.error("--batch-size 必须为正整数")
 
-    service = Service(args.model_dir, args.device, args.batch_size)
+    service = Service(args.model_dir, args.device, args.batch_size, models_root=args.models_root)
 
     if args.preload:
         service.warmup()
