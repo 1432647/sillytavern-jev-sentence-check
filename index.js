@@ -45,6 +45,8 @@ const DEFAULT_SETTINGS = {
     lastModel: DEFAULT_MODEL,
     lastMirror: 'modelscope',
     lastInstallDir: '',
+    // 后端设备：装 CUDA 版还是纯 CPU 版的 torch（决定安装体积与速度）
+    lastDeviceKind: 'gpu',
 };
 
 let context = null;
@@ -619,6 +621,17 @@ const DIALOG_HTML = `
             右上角状态灯显示 <code>direct</code> 就是走的这条路。
         </div>
         <div class="jev-row">
+            <span class="jev-label">设备</span>
+            <select class="text_pole" data-role="device-kind" style="flex:1">
+                <option value="gpu">GPU（NVIDIA CUDA）— 快，需支持 bf16 的显卡</option>
+                <option value="cpu">纯 CPU（内存）— 无需显卡，0.8B 约 1.2 s/句，内存 4 GB 起</option>
+            </select>
+        </div>
+        <div class="jev-hint" data-role="device-note">
+            这里的选择决定生成的安装脚本装哪种 PyTorch：GPU 版约 3 GB，CPU 版约 0.2 GB。
+            两种模式跑同一套模型与判定逻辑，结果一致。
+        </div>
+        <div class="jev-row">
             <span class="jev-label">安装到</span>
             <input class="text_pole jev-mono" data-role="install-dir" style="flex:1"
                    placeholder="例如 D:\\jev-backend" />
@@ -724,6 +737,7 @@ function buildDialog() {
         downloadState: find('download-state'),
         installDir: find('install-dir'),
         installHint: find('install-hint'),
+        deviceKind: find('device-kind'),
         progressBar: find('progress-bar'),
         progressText: find('progress-text'),
         error: find('error'),
@@ -788,6 +802,11 @@ function buildDialog() {
 
     ui.installDir.addEventListener('input', () => {
         settings.lastInstallDir = ui.installDir.value;
+        context.saveSettingsDebounced();
+    });
+
+    ui.deviceKind.addEventListener('change', () => {
+        settings.lastDeviceKind = ui.deviceKind.value;
         context.saveSettingsDebounced();
     });
 
@@ -859,6 +878,7 @@ function showDialog() {
     ui.thresholdValue.textContent = currentThreshold().toFixed(2);
     ui.excludeTags.value = settings.excludeTags ?? '';
     ui.installDir.value = settings.lastInstallDir ?? '';
+    ui.deviceKind.value = settings.lastDeviceKind === 'cpu' ? 'cpu' : 'gpu';
 
     renderPreview();
     refreshSummary();
@@ -1221,7 +1241,11 @@ async function onGenerateInstallerClicked() {
             files.push({ path: name, content: await response.text() });
         }
 
-        const { filename, content } = buildInstaller({ targetDir, files });
+        const { filename, content } = buildInstaller({
+            targetDir,
+            files,
+            deviceKind: settings.lastDeviceKind === 'cpu' ? 'cpu' : 'gpu',
+        });
         downloadTextFile(filename, content);
 
         ui.installHint.textContent = `已生成 ${filename}（在浏览器下载目录里）。`

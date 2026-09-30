@@ -41,6 +41,83 @@ def _load_infer_module(model_dir: Path):
     return module
 
 
+def _load_predictor_cpu(infer, model_dir: Path):
+    """纯 CPU 加载路径。
+
+    模型自带的 `infer.load_model` 在入口处硬性要求 CUDA（infer.py:54-55），
+    但它后面的全部步骤——meta 建模、safetensors 校验、权重装载、rotary 替换——
+    都是设备无关的。这里按**完全相同的步骤**在 CPU 上重载，
+    模型定义仍然复用 infer.py 里的 `JevModel`（不复制架构代码），
+    只有「加载协议」这一小段属于我们。
+
+    权重转成 fp32：PyTorch CPU 对 bf16 的算子覆盖不全，且这是实测基准
+    （0.8B fp32 约 1164 ms/句）对应的形态。代价是内存翻倍——
+    0.8B 约 3.2 GB，4B 要 16 GB 内存。
+    """
+    import json
+
+    import torch
+    from safetensors import safe_open
+    from torch import nn
+    from transformers import AutoTokenizer, Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5TextModel,
+        Qwen3_5TextRotaryEmbedding,
+    )
+
+    directory = model_dir.resolve()
+    device = torch.device("cpu")
+    info = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    config = Qwen3_5TextConfig(**info["text_config"])
+    config._attn_implementation = "sdpa"
+    config.use_cache = False
+
+    with torch.device("meta"):
+        model = infer.JevModel(Qwen3_5TextModel(config), info["pointer_dim"])
+
+    expected = dict(model.named_parameters())
+    index = json.loads((directory / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    mapping = index["weight_map"]
+    if set(mapping) != set(expected):
+        raise JevRuntimeError("权重清单与模型结构不匹配（模型文件可能不完整）。")
+    for name in sorted(set(mapping.values())):
+        keys = [key for key, shard in mapping.items() if shard == name]
+        with safe_open(str(directory / name), framework="pt", device="cpu") as shard:
+            if set(shard.keys()) != set(keys):
+                raise JevRuntimeError("权重分片内容与清单不符。")
+            for key in keys:
+                value = shard.get_tensor(key)
+                if value.dtype != torch.bfloat16 or value.shape != expected[key].shape:
+                    raise JevRuntimeError(f"权重形状或 dtype 不符合预期：{key}")
+                parent, _, leaf = key.rpartition(".")
+                module = model.get_submodule(parent)
+                # 与 GPU 路径唯一的实质差别：落成 fp32，CPU 上算子覆盖最全
+                setattr(module, leaf, nn.Parameter(value.to(device=device, dtype=torch.float32),
+                                                   requires_grad=False))
+                del value
+    model.backbone.rotary_emb = Qwen3_5TextRotaryEmbedding(config).to(device=device)
+    if any(value.is_meta for value in list(model.parameters()) + list(model.buffers())):
+        raise JevRuntimeError("模型加载不完整。")
+    model.requires_grad_(False)
+    model.eval()
+    model.float()
+
+    # 复用官方 Predictor 的推理逻辑，只把加载好的部件装进去——
+    # 这样 CPU 与 GPU 走完全相同的 predict 代码，不会出现两条路径结果不一致。
+    predictor = infer.Predictor.__new__(infer.Predictor)
+    predictor.model = model
+    predictor.config = info
+    predictor.device = device
+    predictor.tokenizer = AutoTokenizer.from_pretrained(
+        directory, local_files_only=True, trust_remote_code=False, use_fast=True,
+        fix_mistral_regex=False, config=Qwen3_5TextConfig(**info["text_config"]),
+    )
+    if not predictor.tokenizer.is_fast:
+        raise JevRuntimeError("需要一个 fast tokenizer。")
+    predictor.threshold = float(info["bad_threshold"])
+    return predictor
+
+
 class JevRuntime:
     """线程安全的懒加载推理运行时。"""
 
@@ -76,9 +153,14 @@ class JevRuntime:
 
             try:
                 self._infer = _load_infer_module(self.model_dir)
-                # Predictor.__init__ 内部会校验 CUDA 与 bf16 支持，
-                # 不满足条件时直接 raise，我们原样透出即可。
-                self._predictor = self._infer.Predictor(str(self.model_dir), self.device)
+                if self.device.split(":")[0] == "cpu":
+                    # 模型自带加载器在入口硬性要求 CUDA（infer.py:54-55），
+                    # CPU 走我们自己的加载器——模型定义仍复用 infer.py。
+                    self._predictor = _load_predictor_cpu(self._infer, self.model_dir)
+                else:
+                    # GPU：Predictor.__init__ 内部会校验 CUDA 与 bf16 支持，
+                    # 不满足条件时直接 raise，我们原样透出即可。
+                    self._predictor = self._infer.Predictor(str(self.model_dir), self.device)
             except JevRuntimeError:
                 raise
             except Exception as exc:  # noqa: BLE001 - 需要把底层报错原样带给用户

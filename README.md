@@ -225,6 +225,32 @@ SillyTavern 默认不显示这个编号，可以在「用户设置」里打开
 
 ---
 
+## 纯 CPU 模式（v0.2.1）
+
+不需要 NVIDIA 显卡也能跑：安装/生成脚本时选「纯 CPU（内存）」，后端以 `--device cpu` 启动。
+
+- 安装体积：CPU 版 torch 约 **0.2 GB**（GPU 版 cu128 约 3 GB）
+- 实测速度（0.8B，fp32，14 线程）：**单句约 1.2 s，批量摊薄约 0.56 s/句**（GPU 基线 190 ms）
+- 内存需求：权重以 fp32 驻留内存——0.8B 约 4 GB，**4B 需 16 GB 内存起**
+- 判定结果与 GPU 一致（fp32/bf16 存在正常的微小概率差异，方向一致）
+
+实现说明：模型自带的 `infer.load_model` 在入口硬性要求 CUDA（`infer.py:54-55`），
+CPU 走扩展自带的加载器——模型定义仍复用 `infer.py` 的 `JevModel`（不复制架构代码），
+只有「加载协议」这一小段属于本扩展。
+
+## ONNX 路线：已验证、已放弃（决策记录）
+
+用 0.8B 做过一次最小导出实验（torch 2.11 + opset 18，sdpa/eager × 经典 tracer/dynamo 全试）：
+
+- **两种导出器死在同一个算子上**：`aten::linalg_solve_triangular`（ONNX opset 18 无此算子），
+  来自 qwen3_5_text 的 gated delta rule 参考实现里的分块三角求解。
+- 理论绕法是把单位下三角求逆展开成有限 Neumann 级数（可表示为 matmul），
+  但那要**修改 transformers 内部建模代码**，版本升级即漂移——维护成本不可接受。
+- 结论：放弃 ONNX（也就连带放弃了 Rust 单 exe 的捷径——Rust 交付的前提是导出成功）。
+- 数据留存：PyTorch CPU 基准 1164 ms/句（batch=1）、参数量 0.75B、序列 256 tokens。
+
+---
+
 ## 高亮、缓存与 swipe 副本
 
 - 检查前每个选中楼层会**复制出一个新的 swipe**，判定缓存挂在那个新 swipe 上；
