@@ -1,0 +1,230 @@
+/* JEV Sentence Check —— 全部样式都基于 SillyTavern 的 CSS 变量，跟随主题自动适配 */
+
+/* ---------------------------------------------- 消息正文里的高亮 */
+
+.mes_text mark.jev-mark {
+    background-color: rgba(220, 60, 60, 0.22);
+    color: inherit;
+    border-bottom: 1px dashed rgba(220, 60, 60, 0.75);
+    border-radius: 2px;
+    padding: 0 1px;
+    cursor: help;
+}
+
+body.dark .mes_text mark.jev-mark,
+.dark .mes_text mark.jev-mark {
+    background-color: rgba(255, 90, 90, 0.24);
+    border-bottom-color: rgba(255, 120, 120, 0.8);
+}
+
+/* ------------------------------------------------------ 对话框 */
+
+.jev-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 30001;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(2px);
+}
+
+.jev-overlay.jev-hidden {
+    display: none;
+}
+
+.jev-dialog {
+    width: min(680px, calc(100vw - 32px));
+    max-height: calc(100vh - 64px);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px 20px;
+    border-radius: 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    background-color: var(--SmartThemeBlurTintColor);
+    color: var(--SmartThemeBodyColor);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    font-size: 0.95em;
+}
+
+.jev-dialog h3 {
+    margin: 0;
+    font-size: 1.15em;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.jev-dialog h3 .jev-title-spacer {
+    flex: 1;
+}
+
+.jev-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.jev-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.jev-label {
+    opacity: 0.75;
+    font-size: 0.9em;
+}
+
+.jev-hint {
+    opacity: 0.65;
+    font-size: 0.85em;
+    line-height: 1.5;
+}
+
+.jev-mono {
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.9em;
+}
+
+/* ------------------------------------------------------ 状态灯 */
+
+.jev-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    font-size: 0.85em;
+}
+
+.jev-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: #888;
+    flex: none;
+}
+
+.jev-dot.jev-ready { background-color: #3fbf6f; }
+.jev-dot.jev-loading { background-color: #e0a52a; animation: jev-pulse 1.1s ease-in-out infinite; }
+.jev-dot.jev-error { background-color: #d94848; }
+
+@keyframes jev-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+}
+
+/* ------------------------------------------------------ 预览 */
+
+.jev-preview {
+    max-height: 210px;
+    overflow-y: auto;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    padding: 6px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 0.88em;
+}
+
+.jev-preview-row {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 2px 0;
+}
+
+.jev-preview-id {
+    flex: none;
+    min-width: 44px;
+    opacity: 0.7;
+    font-family: var(--monoFontFamily, monospace);
+}
+
+.jev-preview-name {
+    flex: none;
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.85;
+}
+
+.jev-preview-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.65;
+}
+
+.jev-preview-row.jev-cached .jev-preview-id::after {
+    content: " ✓";
+    color: #3fbf6f;
+}
+
+/* ------------------------------------------------------ 进度 */
+
+.jev-progress-track {
+    height: 7px;
+    border-radius: 999px;
+    background-color: var(--SmartThemeBorderColor);
+    overflow: hidden;
+}
+
+.jev-progress-bar {
+    height: 100%;
+    width: 0%;
+    background-color: var(--SmartThemeQuoteColor, #7aa2f7);
+    transition: width 0.2s ease;
+}
+
+/* ------------------------------------------------------ 结果与报错 */
+
+.jev-summary {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.jev-summary span b {
+    font-size: 1.1em;
+}
+
+.jev-error {
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(217, 72, 72, 0.6);
+    background-color: rgba(217, 72, 72, 0.12);
+    color: var(--SmartThemeBodyColor);
+    white-space: pre-wrap;
+    font-size: 0.88em;
+    line-height: 1.5;
+}
+
+.jev-error.jev-hidden,
+.jev-summary.jev-hidden {
+    display: none;
+}
+
+/* ------------------------------------------------------ 菜单按钮 */
+
+#jev_menu_button {
+    cursor: pointer;
+}
+
+/* ------------------------------------------------------ 设置面板 */
+
+.jev-settings-help {
+    opacity: 0.7;
+    font-size: 0.9em;
+    line-height: 1.6;
+    margin-bottom: 4px;
+}

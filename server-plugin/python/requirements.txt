@@ -1,0 +1,10 @@
+# jev-sentence-check —— Python 推理侧依赖
+#
+# 说明：模型仓库的 requirements.txt 里还有 flash-linear-attention / tilelang /
+# causal-conv1d，那三件在 Windows 上编译风险很高，而模型自带的 infer.py
+# 本身只 import torch / safetensors / transformers。
+# 因此这里只固定最小集，实测能跑通就不装那三件。
+
+torch==2.11.0
+transformers==5.17.0
+safetensors==0.8.0

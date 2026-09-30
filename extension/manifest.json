@@ -1,0 +1,14 @@
+{
+    "display_name": "JEV Sentence Check",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "jev-sentence-check",
+    "version": "0.1.0",
+    "hooks": {
+        "activate": "init"
+    }
+}

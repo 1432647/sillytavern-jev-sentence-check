@@ -1,0 +1,8 @@
+# 统一按 LF 存储与检出。这些文件要给 Node 跑、给 Python 跑、也会被浏览器直接加载，
+# 混用 CRLF/LF 没有好处，反而会让跨平台 diff 全是噪音。
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.safetensors binary

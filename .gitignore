@@ -1,0 +1,19 @@
+# 运行时产物（不入版本库）
+runtime/
+node_modules/
+package-lock.json
+
+# 由 install.mjs 生成，含本机绝对路径
+*.cmd
+
+# 本地开发包专有：回归测试与设计文档，不随仓库发布
+test/
+docs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 临时文件
+.tmp-*
