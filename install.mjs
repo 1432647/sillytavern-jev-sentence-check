@@ -186,6 +186,28 @@ function install() {
     console.log(`模型目录:    ${modelDir}${fs.existsSync(modelDir) ? '' : '   ! 不存在'}`);
     console.log('');
 
+    // 在复制任何文件之前先卡住。
+    // 不这么做的话，会静默写入一个指向不存在解释器的 config.json，
+    // 直到用户在界面上点「预热」时才报错，那时已经很难定位了。
+    const problems = [];
+    if (!fs.existsSync(pythonExe)) {
+        problems.push(`找不到 Python 解释器：${pythonExe}`);
+    }
+    if (!fs.existsSync(modelDir)) {
+        problems.push(`找不到模型目录：${modelDir}`);
+    }
+    if (problems.length > 0 && !argv.includes('--force')) {
+        console.error('安装前检查未通过：');
+        for (const problem of problems) {
+            console.error(`  - ${problem}`);
+        }
+        console.error('');
+        console.error('请先按 README 的「安装」步骤建好 Python 环境并下好模型，然后重跑。');
+        console.error('也可以用 --python <路径> / --model <路径> 显式指定，');
+        console.error('或加 --force 跳过这项检查（不推荐，部署后需要手工修 config.json）。');
+        process.exit(1);
+    }
+
     // 1. 前端扩展
     const extensionTarget = path.join(stRoot, 'public', 'scripts', 'extensions', 'third-party', EXTENSION_DIR_NAME);
     copyTree(path.join(HERE, 'extension'), extensionTarget);
