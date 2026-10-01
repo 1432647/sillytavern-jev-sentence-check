@@ -22,7 +22,7 @@ import { clearHighlights, highlightElement } from './lib/highlight-dom.js';
 import * as store from './lib/store.js';
 import { MODES, createTransport } from './lib/transport.js';
 import * as swipes from './lib/swipes.js';
-import { BACKEND_FILES, LAUNCHER_FILES, buildInstaller } from './lib/backend-install.js';
+import { BACKEND_FILES, LAUNCHER_FILES, buildInstaller, pickBundleAssets, distReleaseApiUrl } from './lib/backend-install.js';
 
 const MARK_CLASS = 'jev-mark';
 const MAX_FLOORS_PER_RUN = 50;
@@ -632,6 +632,17 @@ const DIALOG_HTML = `
             两种模式跑同一套模型与判定逻辑，结果一致。
         </div>
         <div class="jev-row">
+            <span class="jev-label">快速安装</span>
+            <button class="menu_button" data-role="download-bundle">下载预打包后端</button>
+            <span class="jev-title-spacer"></span>
+            <span class="jev-hint" data-role="bundle-state"></span>
+        </div>
+        <div class="jev-hint">
+            按上面选的设备下载**打好的整包**（自带 Python，解压即用，机器上不用装 Python，也不用跑安装脚本）。
+            GPU 包超过 2GB 会拆成多卷：全部下载后，在命令行里用
+            <code>copy /b 文件名.zip.001+文件名.zip.002 文件名.zip</code> 合并，发布页有说明。
+        </div>
+        <div class="jev-row">
             <span class="jev-label">安装到</span>
             <input class="text_pole jev-mono" data-role="install-dir" style="flex:1"
                    placeholder="例如 D:\\jev-backend" />
@@ -738,6 +749,7 @@ function buildDialog() {
         installDir: find('install-dir'),
         installHint: find('install-hint'),
         deviceKind: find('device-kind'),
+        bundleState: find('bundle-state'),
         progressBar: find('progress-bar'),
         progressText: find('progress-text'),
         error: find('error'),
@@ -760,6 +772,7 @@ function buildDialog() {
     find('warmup').addEventListener('click', onWarmupClicked);
     find('clear-cache').addEventListener('click', onClearCacheClicked);
     find('generate-installer').addEventListener('click', onGenerateInstallerClicked);
+    find('download-bundle').addEventListener('click', onDownloadBundleClicked);
     find('model-refresh').addEventListener('click', () => refreshModels({ announce: true }));
     find('download-model').addEventListener('click', onDownloadModelClicked);
     find('cancel-download').addEventListener('click', onCancelDownloadClicked);
@@ -1199,6 +1212,55 @@ async function onCancelDownloadClicked() {
 }
 
 // ------------------------------------------------------- 生成后端安装脚本
+
+/**
+ * 触发浏览器下载（预构建包走 GitHub 的重定向直链，
+ * 服务器带 Content-Disposition: attachment，浏览器会直接下载）。
+ */
+function triggerDownload(url) {
+    const link = document.createElement('a');
+    link.href = url;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+}
+
+/**
+ * 下载预构建后端包：按设备从 GitHub Release 拿资产并触发浏览器下载。
+ * 拆卷的 GPU 包会一次触发多个下载（浏览器可能询问一次「下载多个文件」许可）。
+ */
+async function onDownloadBundleClicked() {
+    clearError();
+
+    const kind = settings.lastDeviceKind === 'cpu' ? 'cpu' : 'gpu';
+    ui.bundleState.textContent = '正在查询发布页…';
+
+    try {
+        const response = await fetch(distReleaseApiUrl(), {
+            headers: { Accept: 'application/vnd.github+json' },
+        });
+        if (!response.ok) {
+            throw new Error(`GitHub 返回 ${response.status}`);
+        }
+        const release = await response.json();
+
+        const assets = pickBundleAssets(release, kind);
+        if (assets.length === 0) {
+            throw new Error(`${kind === 'cpu' ? 'CPU' : 'GPU'} 预构建包还没有发布，可以先用下面的「生成一键安装脚本」。`);
+        }
+
+        for (const asset of assets) {
+            triggerDownload(asset.url);
+        }
+        const totalGB = (assets.reduce((sum, asset) => sum + asset.size, 0) / 1e9).toFixed(1);
+        ui.bundleState.textContent = assets.length > 1
+            ? `已开始下载 ${assets.length} 个分卷（共约 ${totalGB} GB）。全部下完后按发布页说明合并，解压即用。`
+            : `已开始下载（约 ${totalGB} GB）。下载完成后解压，双击 start-backend.bat 即可。`;
+    } catch (error) {
+        ui.bundleState.textContent = '';
+        showError(`获取预构建包失败：${error?.message ?? error}。可以改用下面的「生成一键安装脚本」。`);
+    }
+}
 
 function downloadTextFile(filename, content) {
     const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
