@@ -22,7 +22,10 @@ import { clearHighlights, highlightElement } from './lib/highlight-dom.js';
 import * as store from './lib/store.js';
 import { MODES, createTransport } from './lib/transport.js';
 import * as swipes from './lib/swipes.js';
-import { BACKEND_FILES, LAUNCHER_FILES, buildInstaller, pickBundleAssets, distReleaseApiUrl } from './lib/backend-install.js';
+import {
+    BACKEND_FILES, LAUNCHER_FILES, buildInstaller, pickBundleAssets, pickBundleAssetsModelScope,
+    modelScopeFilesApiUrl, distReleaseApiUrl,
+} from './lib/backend-install.js';
 
 const MARK_CLASS = 'jev-mark';
 const MAX_FLOORS_PER_RUN = 50;
@@ -1226,8 +1229,10 @@ function triggerDownload(url) {
 }
 
 /**
- * 下载预构建后端包：按设备从 GitHub Release 拿资产并触发浏览器下载。
- * 拆卷的 GPU 包会一次触发多个下载（浏览器可能询问一次「下载多个文件」许可）。
+ * 下载预构建后端包：按设备从发布渠道拿资产并触发浏览器下载。
+ *
+ * 主渠道是**魔搭**（国内直连，文件清单接口与模型下载同源）；
+ * GitHub 作备用渠道（国内 api.github.com 常 403/限流，所以放后面）。
  */
 async function onDownloadBundleClicked() {
     clearError();
@@ -1235,7 +1240,28 @@ async function onDownloadBundleClicked() {
     const kind = settings.lastDeviceKind === 'cpu' ? 'cpu' : 'gpu';
     ui.bundleState.textContent = '正在查询发布页…';
 
+    const errors = [];
+
+    // 主渠道：魔搭
     try {
+        const payload = await (await fetch(modelScopeFilesApiUrl())).json();
+        const assets = pickBundleAssetsModelScope(payload, kind);
+        if (assets.length > 0) {
+            for (const asset of assets) {
+                triggerDownload(asset.url);
+            }
+            const totalGB = (assets.reduce((sum, asset) => sum + asset.size, 0) / 1e9).toFixed(1);
+            ui.bundleState.textContent = `已开始下载（约 ${totalGB} GB，来自魔搭）。下载完成后解压，双击 start-backend.bat。`;
+            return;
+        }
+        errors.push(`魔搭上还没有 ${kind === 'cpu' ? 'CPU' : 'GPU'} 预构建包`);
+    } catch (error) {
+        errors.push(`魔搭查询失败：${error?.message ?? error}`);
+    }
+
+    // 备用渠道：GitHub
+    try {
+        ui.bundleState.textContent = '魔搭未命中，尝试 GitHub…';
         const response = await fetch(distReleaseApiUrl(), {
             headers: { Accept: 'application/vnd.github+json' },
         });
@@ -1243,23 +1269,22 @@ async function onDownloadBundleClicked() {
             throw new Error(`GitHub 返回 ${response.status}`);
         }
         const release = await response.json();
-
         const assets = pickBundleAssets(release, kind);
         if (assets.length === 0) {
-            throw new Error(`${kind === 'cpu' ? 'CPU' : 'GPU'} 预构建包还没有发布，可以先用下面的「生成一键安装脚本」。`);
+            throw new Error('GitHub 上也没有对应的预构建包');
         }
-
         for (const asset of assets) {
             triggerDownload(asset.url);
         }
         const totalGB = (assets.reduce((sum, asset) => sum + asset.size, 0) / 1e9).toFixed(1);
-        ui.bundleState.textContent = assets.length > 1
-            ? `已开始下载 ${assets.length} 个分卷（共约 ${totalGB} GB）。全部下完后按发布页说明合并，解压即用。`
-            : `已开始下载（约 ${totalGB} GB）。下载完成后解压，双击 start-backend.bat 即可。`;
+        ui.bundleState.textContent = `已开始下载 ${assets.length} 个文件（共约 ${totalGB} GB，来自 GitHub）。GPU 包需要按发布页说明合并分卷。`;
+        return;
     } catch (error) {
-        ui.bundleState.textContent = '';
-        showError(`获取预构建包失败：${error?.message ?? error}。可以改用下面的「生成一键安装脚本」。`);
+        errors.push(`GitHub 查询失败：${error?.message ?? error}`);
     }
+
+    ui.bundleState.textContent = '';
+    showError(`两个渠道都没拿到预构建包（${errors.join('；')}）。可以改用下面的「生成一键安装脚本」。`);
 }
 
 function downloadTextFile(filename, content) {
